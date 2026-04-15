@@ -2,11 +2,14 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const admin = require('firebase-admin');
 const cron = require('node-cron');
-const express = require('express'); // Dummy web server
+const express = require('express');
 
-// --- 1. SETUP & CONNECTIONS ---
+// ==========================================
+// SETUP & CONNECTIONS
+// ==========================================
 const app = express();
-// --- SAFELY CONNECT TO FIREBASE ---
+
+// SAFELY CONNECT TO FIREBASE
 let serviceAccount;
 if (process.env.FIREBASE_JSON) {
     // If running on Render, use the secret Environment Variable
@@ -20,6 +23,7 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 const db = admin.firestore();
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const BOT_LINK = `https://t.me/${process.env.BOT_USERNAME}?start=verify`;
 
@@ -27,9 +31,6 @@ const BOT_LINK = `https://t.me/${process.env.BOT_USERNAME}?start=verify`;
 // MODULE 1: SPECIALIST & CLASSROOM MANAGER
 // ==========================================
 
-/**
- * COMMAND: /register [password] (Used in DMs by staff)
- */
 bot.command('register', async (ctx) => {
     try {
         const messageText = ctx.message.text.split(' ');
@@ -40,7 +41,6 @@ bot.command('register', async (ctx) => {
         }
 
         const specialistId = ctx.from.id.toString();
-        // Fallback just in case a user has no first name set on Telegram
         const specialistName = ctx.from.first_name || "Specialist";
 
         await db.collection('specialists').doc(specialistId).set({
@@ -56,22 +56,16 @@ bot.command('register', async (ctx) => {
     }
 });
 
-/**
- * COMMAND: /claim (Used inside the group by the Specialist)
- */
 bot.command('claim', async (ctx) => {
     try {
-        // CRASH PROTECTION 1: Stop them from using this in a DM
         if (ctx.chat.type === 'private') {
             return ctx.reply("❌ You cannot claim a Direct Message! You must type this command inside the actual Skillforge Telegram Group.");
         }
 
         const specialistId = ctx.from.id.toString();
         const groupId = ctx.chat.id.toString();
-        // CRASH PROTECTION 2: Ensure we always have a name
         const groupName = ctx.chat.title || "Skillforge Classroom"; 
 
-        // Check if they are registered first
         const specialistDoc = await db.collection('specialists').doc(specialistId).get();
         if (!specialistDoc.exists) {
             return ctx.reply("❌ You must be registered as a Specialist first! Go to my Direct Messages and type: /register YOUR_PASSWORD");
@@ -80,7 +74,6 @@ bot.command('claim', async (ctx) => {
         const specialistData = specialistDoc.data();
         const specialistName = specialistData.name || "Specialist";
 
-        // Save to Firebase
         await db.collection('classrooms').doc(groupId).set({
             group_id: groupId,
             group_name: groupName,
@@ -95,17 +88,13 @@ bot.command('claim', async (ctx) => {
     }
 });
 
-/**
- * CRON: Morning Class Check (Runs every day at 8:00 AM Lagos Time)
- * Asks every Specialist about their specific groups
- */
+// Morning Class Check (Runs every day at 8:00 AM Lagos Time)
 cron.schedule('0 8 * * *', async () => {
     const classroomsSnapshot = await db.collection('classrooms').get();
     if (classroomsSnapshot.empty) return;
 
     classroomsSnapshot.forEach(async (doc) => {
         const room = doc.data();
-        
         const message = `Good morning Specialist ${room.specialist_name}! ☀️\n\nDo we have a class for **${room.group_name}** today?\n\nIf yes, copy the command below, add your time, and send it back to me:\n\n\`/setclass ${room.group_id} 14:00\``;
         
         try {
@@ -116,10 +105,6 @@ cron.schedule('0 8 * * *', async () => {
     });
 }, { timezone: "Africa/Lagos" });
 
-/**
- * COMMAND: /setclass [group_id] [time]
- * Specialist sets the time for a specific classroom
- */
 bot.command('setclass', async (ctx) => {
     const args = ctx.message.text.split(' ');
     const groupId = args[1];
@@ -131,7 +116,6 @@ bot.command('setclass', async (ctx) => {
 
     const todayStr = new Date().toISOString().split('T')[0]; 
     
-    // Save the class schedule for this specific group
     await db.collection('classes').doc(groupId).set({
         date: todayStr,
         time: timeInput,
@@ -139,16 +123,13 @@ bot.command('setclass', async (ctx) => {
         group_id: groupId
     });
 
-    // Let the specialist know it worked
     const roomDoc = await db.collection('classrooms').doc(groupId).get();
     const groupName = roomDoc.exists ? roomDoc.data().group_name : "the group";
 
     ctx.reply(`✅ Locked in! Class for **${groupName}** is set for ${timeInput} today. I will handle the 30-minute warning. 🚀`, { parse_mode: 'Markdown' });
 });
 
-/**
- * CRON: 30-Minute Class Warning (Checks every minute)
- */
+// 30-Minute Class Warning Check
 cron.schedule('* * * * *', async () => {
     const classesSnapshot = await db.collection('classes').get();
     if (classesSnapshot.empty) return;
@@ -168,7 +149,6 @@ cron.schedule('* * * * *', async () => {
         const [classHour, classMin] = classData.time.split(':').map(Number);
         const classTotalMins = (classHour * 60) + classMin;
 
-        // Is it exactly 30 minutes before class?
         if (classTotalMins - currentTotalMins === 30) {
             const message = `🚨 **CLASS REMINDER** 🚨\n\nSkillforge trainees, class will begin in exactly **30 minutes** (at ${classData.time}).\n\nPlease get your tools and workstations ready!`;
             
@@ -181,7 +161,6 @@ cron.schedule('* * * * *', async () => {
         }
     });
 }, { timezone: "Africa/Lagos" });
-
 
 // ==========================================
 // MODULE 2: STUDENT VERIFICATION SYSTEM
@@ -204,19 +183,12 @@ bot.on('new_chat_members', async (ctx) => {
             });
         }
 
-        // We added "await" here so the try/catch can properly detect message failures
         await ctx.reply(`Welcome to Skillforge Digital! 🚀\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
             Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', BOT_LINK)])
         );
     } catch (error) {
-        // If the bot gets kicked or muted, it will silently log the error instead of crashing!
         console.log("Could not send welcome message (Bot might have been kicked):", error.message);
     }
-});
-
-    ctx.reply(`Welcome to Skillforge Digital! 🚀\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
-        Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', BOT_LINK)])
-    );
 });
 
 bot.start(async (ctx) => {
@@ -236,7 +208,9 @@ bot.start(async (ctx) => {
             await ctx.telegram.restrictChatMember(doc.data().group_id, userId, {
                 permissions: { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_other_messages: true, can_add_web_page_previews: true }
             });
-        } catch (error) { }
+        } catch (error) { 
+            console.log("Permission restore error:", error.message);
+        }
 
         ctx.reply("Verification successful! ✅ You now have full access.");
     } else {
@@ -259,7 +233,9 @@ cron.schedule('0 * * * *', async () => {
         const message = `⚠️ **Verification Reminder** ⚠️\n\n${users.length} members still need to verify. Please verify to avoid a chat timeout:\n${users.join(', ')}`;
         try {
             await bot.telegram.sendMessage(groupId, message, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', BOT_LINK)]) });
-        } catch (error) { }
+        } catch (error) { 
+            console.log("Hourly reminder error:", error.message);
+        }
     }
 });
 
@@ -277,18 +253,19 @@ cron.schedule('*/30 * * * *', async () => {
             await db.collection('pending_verifications').doc(doc.id).update({ timed_out: true });
             const message = `⏳ @${data.username} has been timed out for failing to verify within 24 hours.`;
             await bot.telegram.sendMessage(data.group_id, message, Markup.inlineKeyboard([Markup.button.url('Verify to Restore Access 🔓', BOT_LINK)]));
-        } catch (error) { }
+        } catch (error) { 
+            console.log("Timeout enforcement error:", error.message);
+        }
     }
 });
 
-/// ==========================================
+// ==========================================
 // MODULE 3: SERVER START
 // ==========================================
 
 app.get('/', (req, res) => res.send('Skillforge Principal Bot is running!'));
 const PORT = process.env.PORT || 3000;
 
-// Notice the '0.0.0.0' added right here!
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
 bot.launch().then(() => console.log('Skillforge Bot is fully operational!'));
