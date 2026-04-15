@@ -29,55 +29,70 @@ const BOT_LINK = `https://t.me/${process.env.BOT_USERNAME}?start=verify`;
 
 /**
  * COMMAND: /register [password] (Used in DMs by staff)
- * Onboards a new Specialist
  */
 bot.command('register', async (ctx) => {
-    const messageText = ctx.message.text.split(' ');
-    const password = messageText[1];
+    try {
+        const messageText = ctx.message.text.split(' ');
+        const password = messageText[1];
 
-    if (password !== process.env.STAFF_PASSWORD) {
-        return ctx.reply("❌ Invalid Skillforge master password.");
+        if (password !== process.env.STAFF_PASSWORD) {
+            return ctx.reply("❌ Invalid Skillforge master password.");
+        }
+
+        const specialistId = ctx.from.id.toString();
+        // Fallback just in case a user has no first name set on Telegram
+        const specialistName = ctx.from.first_name || "Specialist";
+
+        await db.collection('specialists').doc(specialistId).set({
+            telegram_id: specialistId,
+            name: specialistName,
+            registered_at: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        ctx.reply(`✅ Welcome to the team, Specialist ${specialistName}! \n\nYou are now authorized. Please go to your cohort's Telegram group, add me as an Admin, and type /claim to link the classroom.`);
+    } catch (error) {
+        console.log("Register Error:", error);
+        ctx.reply("❌ An error occurred during registration.");
     }
-
-    const specialistId = ctx.from.id.toString();
-    const specialistName = ctx.from.first_name;
-
-    // Save Specialist to Firebase
-    await db.collection('specialists').doc(specialistId).set({
-        telegram_id: specialistId,
-        name: specialistName,
-        registered_at: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    ctx.reply(`✅ Welcome to the team, Specialist ${specialistName}! \n\nYou are now authorized. Please go to your cohort's Telegram group, add me as an Admin, and type /claim to link the classroom to your profile.`);
 });
 
 /**
  * COMMAND: /claim (Used inside the group by the Specialist)
- * Links the group to the Specialist and grabs the group name
  */
 bot.command('claim', async (ctx) => {
-    const specialistId = ctx.from.id.toString();
-    const groupId = ctx.chat.id.toString();
-    const groupName = ctx.chat.title; // Grabs the name! e.g., "Currency Pairs"
+    try {
+        // CRASH PROTECTION 1: Stop them from using this in a DM
+        if (ctx.chat.type === 'private') {
+            return ctx.reply("❌ You cannot claim a Direct Message! You must type this command inside the actual Skillforge Telegram Group.");
+        }
 
-    // 1. Check if the person is a verified Specialist
-    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
-    if (!specialistDoc.exists) {
-        return ctx.reply("❌ You must be registered as a Specialist to claim a group.");
+        const specialistId = ctx.from.id.toString();
+        const groupId = ctx.chat.id.toString();
+        // CRASH PROTECTION 2: Ensure we always have a name
+        const groupName = ctx.chat.title || "Skillforge Classroom"; 
+
+        // Check if they are registered first
+        const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+        if (!specialistDoc.exists) {
+            return ctx.reply("❌ You must be registered as a Specialist first! Go to my Direct Messages and type: /register YOUR_PASSWORD");
+        }
+
+        const specialistData = specialistDoc.data();
+        const specialistName = specialistData.name || "Specialist";
+
+        // Save to Firebase
+        await db.collection('classrooms').doc(groupId).set({
+            group_id: groupId,
+            group_name: groupName,
+            specialist_id: specialistId,
+            specialist_name: specialistName
+        });
+
+        ctx.reply(`✅ Classroom successfully linked!\n\nI have registered this group as **${groupName}** under Specialist **${specialistName}**.`);
+    } catch (error) {
+        console.log("Claim Error:", error);
+        ctx.reply("❌ An error occurred while trying to claim the group. Please try again.");
     }
-
-    const specialistData = specialistDoc.data();
-
-    // 2. Save the Classroom to Firebase
-    await db.collection('classrooms').doc(groupId).set({
-        group_id: groupId,
-        group_name: groupName,
-        specialist_id: specialistId,
-        specialist_name: specialistData.name
-    });
-
-    ctx.reply(`✅ Classroom successfully linked!\n\nI have registered this group as **${groupName}** under Specialist **${specialistData.name}**.\n\nI will DM the Specialist every morning to ask about the class schedule.`);
 });
 
 /**
