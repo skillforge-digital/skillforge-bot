@@ -270,13 +270,15 @@ cron.schedule('*/30 * * * *', async () => {
     }
 });
 
-// ==========================================
+/// ==========================================
 // MODULE 3: SERVER START
 // ==========================================
 
 app.get('/', (req, res) => res.send('Skillforge Principal Bot is running!'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Web server listening on port ${PORT}`));
+
+// Notice the '0.0.0.0' added right here!
+app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
 bot.launch().then(() => console.log('Skillforge Bot is fully operational!'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
