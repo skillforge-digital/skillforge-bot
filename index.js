@@ -6,7 +6,15 @@ const express = require('express'); // Dummy web server
 
 // --- 1. SETUP & CONNECTIONS ---
 const app = express();
-const serviceAccount = require('./firebase-service-account.json');
+// --- SAFELY CONNECT TO FIREBASE ---
+let serviceAccount;
+if (process.env.FIREBASE_JSON) {
+    // If running on Render, use the secret Environment Variable
+    serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
+} else {
+    // If running on your computer, use the local file
+    serviceAccount = require('./firebase-service-account.json');
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
