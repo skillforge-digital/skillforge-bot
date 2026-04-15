@@ -188,20 +188,31 @@ cron.schedule('* * * * *', async () => {
 // ==========================================
 
 bot.on('new_chat_members', async (ctx) => {
-    const newMembers = ctx.message.new_chat_members;
-    const groupId = ctx.chat.id.toString();
+    try {
+        const newMembers = ctx.message.new_chat_members;
+        const groupId = ctx.chat.id.toString();
 
-    for (const member of newMembers) {
-        if (member.is_bot) continue;
-        await db.collection('pending_verifications').doc(member.id.toString()).set({
-            telegram_id: member.id,
-            username: member.username || member.first_name,
-            group_id: groupId,
-            joined_at: admin.firestore.FieldValue.serverTimestamp(),
-            verified: false,
-            timed_out: false
-        });
+        for (const member of newMembers) {
+            if (member.is_bot) continue;
+            await db.collection('pending_verifications').doc(member.id.toString()).set({
+                telegram_id: member.id,
+                username: member.username || member.first_name,
+                group_id: groupId,
+                joined_at: admin.firestore.FieldValue.serverTimestamp(),
+                verified: false,
+                timed_out: false
+            });
+        }
+
+        // We added "await" here so the try/catch can properly detect message failures
+        await ctx.reply(`Welcome to Skillforge Digital! 🚀\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
+            Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', BOT_LINK)])
+        );
+    } catch (error) {
+        // If the bot gets kicked or muted, it will silently log the error instead of crashing!
+        console.log("Could not send welcome message (Bot might have been kicked):", error.message);
     }
+});
 
     ctx.reply(`Welcome to Skillforge Digital! 🚀\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
         Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', BOT_LINK)])
