@@ -147,6 +147,14 @@ const dateToString = (date) => {
     return new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Lagos' }).format(date);
 };
 
+/**
+ * Calculates the weekly performance metrics for a given group and week.
+ * @param {string} groupId - The ID of the classroom group.
+ * @param {Date} weekStartDate - The start date of the week (Monday).
+ * @param {Date} weekEndDate - The end date of the week (Sunday).
+ * @param {Object} plan - The course plan object with sessions_per_week, min_days_per_week, etc.
+ * @returns {Object} Performance metrics including attendance, sessions held, etc.
+ */
 const getWeekPerformance = async (groupId, weekStartDate, weekEndDate, plan) => {
     const weekStart = dateToString(weekStartDate);
     const weekEnd = dateToString(weekEndDate);
@@ -218,6 +226,11 @@ const getActiveReviewSession = async (userId) => {
     return sessionSnapshot.empty ? null : { id: sessionSnapshot.docs[0].id, data: sessionSnapshot.docs[0].data() };
 };
 
+/**
+ * Builds a PDF buffer for the weekly review report.
+ * @param {Object} session - The questionnaire session data.
+ * @returns {Buffer} The PDF buffer.
+ */
 const buildReviewPdf = async (session) => {
     const lines = [];
     lines.push('Weekly Review Report');
@@ -1000,29 +1013,56 @@ bot.command('questionnaire', async (ctx) => {
     });
 });
 
-bot.action(/^review_start_(.+)$/, async (ctx) => {
-    const sessionId = ctx.match[1];
-    const sessionRef = db.collection('questionnaire_sessions').doc(sessionId);
-    const sessionDoc = await sessionRef.get();
-    if (!sessionDoc.exists) {
-        await ctx.answerCbQuery('Review session not found.');
-        return;
+bot.action(/^schedule_(.+)$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    const specialistId = ctx.from.id.toString();
+
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    if (!roomDoc.exists || roomDoc.data().specialist_id !== specialistId) {
+        return ctx.answerCbQuery('Invalid group.');
     }
 
-    const session = sessionDoc.data();
-    if (session.status !== 'pending') {
-        await ctx.answerCbQuery('This review session has already started or completed.');
-        return;
+    // Prompt for time
+    ctx.editMessageText(`Scheduling for ${roomDoc.data().group_name}. Please reply with the time in HH:MM format (e.g., 14:00) and optional topic.`);
+    // Note: This is simplistic; in a real app, use a state machine for multi-step input.
+    ctx.answerCbQuery();
+});
+
+bot.action('report_weekly', async (ctx) => {
+    const specialistId = ctx.from.id.toString();
+    // Trigger weekly report logic
+    ctx.editMessageText('Generating weekly report...');
+    // Call the weeklyreport command logic here
+    ctx.answerCbQuery();
+});
+
+bot.action('report_attendance', async (ctx) => {
+    const specialistId = ctx.from.id.toString();
+    // Trigger attendance report
+    ctx.editMessageText('Generating attendance report...');
+    ctx.answerCbQuery();
+});
+
+bot.action('report_progress', async (ctx) => {
+    const specialistId = ctx.from.id.toString();
+    // Trigger course progress
+    ctx.editMessageText('Generating course progress report...');
+    ctx.answerCbQuery();
+});
+
+bot.action('settings_name', async (ctx) => {
+    ctx.editMessageText('To change your name, reply with your new name.');
+    ctx.answerCbQuery();
+});
+
+bot.action('settings_profile', async (ctx) => {
+    const specialistId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (specialistDoc.exists) {
+        const data = specialistDoc.data();
+        ctx.editMessageText(`Profile:\nName: ${data.name}\nRegistered: ${data.registered_at.toDate().toLocaleDateString()}`);
     }
-
-    await sessionRef.update({
-        status: 'in_progress',
-        updated_at: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    await ctx.editMessageText('✅ Weekly review started. I will ask you the questions one by one.');
-    await ctx.reply(`Question 1 of ${REVIEW_QUESTIONS.length}: ${REVIEW_QUESTIONS[0]}`);
-    await ctx.answerCbQuery();
+    ctx.answerCbQuery();
 });
 
 // Handle feedback messages in private chat and active review sessions
@@ -1544,8 +1584,142 @@ bot.start(async (ctx) => {
 
         ctx.reply("Verification successful! ✅ You now have full access.");
     } else {
-        ctx.reply("Welcome! If you are a Specialist, use /register [password]. If you are a trainee, use the verify button in your main group.");
+        // Check if registered specialist
+        const specialistDoc = await db.collection('specialists').doc(userId).get();
+        if (specialistDoc.exists) {
+            // Show menu for specialists
+            ctx.reply("Welcome back, Specialist! Choose an option:", Markup.keyboard([
+                ['Submit Weekly Report', 'Schedule Class'],
+                ['View My Classes', 'View Reports'],
+                ['Help', 'Settings']
+            ]).resize());
+        } else {
+            ctx.reply("Welcome! If you are a Specialist, use /register [password]. If you are a trainee, use the verify button in your main group.");
+        }
     }
+});
+
+// Menu handlers
+bot.hears('Submit Weekly Report', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+
+    const specialistId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    // Check if it's Saturday
+    const today = new Date();
+    if (today.getDay() !== 6) { // 0=Sunday, 6=Saturday
+        return ctx.reply('Weekly reports can only be submitted on Saturdays.');
+    }
+
+    // Proceed to questionnaire logic
+    const groupsSnapshot = await db.collection('classrooms')
+        .where('specialist_id', '==', specialistId)
+        .get();
+
+    if (groupsSnapshot.empty) {
+        return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+    }
+
+    let groupId;
+    if (groupsSnapshot.size === 1) {
+        groupId = groupsSnapshot.docs[0].id;
+    } else {
+        let listResponse = 'You have multiple classroom groups. Please select one:\n';
+        groupsSnapshot.docs.forEach(doc => {
+            const room = doc.data();
+            listResponse += `• ${room.group_name}: ${doc.id}\n`;
+        });
+        return ctx.reply(listResponse + '\nUse /questionnaire <group_id> to proceed.');
+    }
+
+    // Start the questionnaire for the group
+    const sessionId = `${specialistId}_${groupId}_${Date.now()}`;
+    await db.collection('questionnaire_sessions').doc(sessionId).set({
+        specialist_id: specialistId,
+        group_id: groupId,
+        current_question: 0,
+        answers: {},
+        started_at: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    ctx.reply('Starting weekly questionnaire...', Markup.inlineKeyboard([
+        Markup.button.callback('Start Review', `review_start_${sessionId}`)
+    ]));
+});
+
+bot.hears('Schedule Class', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+
+    const specialistId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    const groupsSnapshot = await db.collection('classrooms')
+        .where('specialist_id', '==', specialistId)
+        .get();
+
+    if (groupsSnapshot.empty) {
+        return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+    }
+
+    let response = 'Select a group to schedule a class:\n';
+    const buttons = [];
+    groupsSnapshot.docs.forEach(doc => {
+        const room = doc.data();
+        response += `• ${room.group_name}: ${doc.id}\n`;
+        buttons.push([Markup.button.callback(`Schedule for ${room.group_name}`, `schedule_${doc.id}`)]);
+    });
+    response += '\nOr use /setclass <group_id> <time> [topic]';
+
+    ctx.reply(response, Markup.inlineKeyboard(buttons));
+});
+
+bot.hears('View Reports', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+
+    const specialistId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    ctx.reply('Choose a report type:', Markup.inlineKeyboard([
+        [Markup.button.callback('Weekly Report', 'report_weekly')],
+        [Markup.button.callback('Attendance Report', 'report_attendance')],
+        [Markup.button.callback('Course Progress', 'report_progress')]
+    ]));
+});
+
+bot.hears('Settings', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+
+    const specialistId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    ctx.reply('Settings options:', Markup.inlineKeyboard([
+        [Markup.button.callback('Change Name', 'settings_name')],
+        [Markup.button.callback('View Profile', 'settings_profile')]
+    ]));
+});
+
+bot.hears('Help', async (ctx) => {
+    ctx.reply(`Help Menu:
+- Submit Weekly Report: Start the weekly questionnaire (only on Saturdays)
+- Schedule Class: Schedule a new class for your groups
+- View My Classes: List your linked groups
+- View Reports: Access various reports
+- Settings: Manage your profile
+- Use /register [password] to register as specialist
+- Use /claim in a group to link it`);
 });
 
 cron.schedule('0 * * * *', async () => {
@@ -1680,6 +1854,30 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
-bot.launch().then(() => console.log('Skillforge Bot is fully operational!'));
+bot.launch().then(async () => {
+    console.log('Skillforge Bot is fully operational!');
+    
+    // Set bot commands for the menu
+    await bot.telegram.setMyCommands([
+        { command: 'start', description: 'Start the bot and show menu' },
+        { command: 'register', description: 'Register as a Specialist (staff only)' },
+        { command: 'claim', description: 'Link a group as your classroom' },
+        { command: 'setclass', description: 'Schedule a live session' },
+        { command: 'cancelclass', description: 'Cancel scheduled sessions' },
+        { command: 'rescheduleclass', description: 'Change session time' },
+        { command: 'status', description: 'View daily status and schedule' },
+        { command: 'classlist', description: 'List upcoming sessions' },
+        { command: 'health', description: 'Check bot health' },
+        { command: 'attended', description: 'Mark attendance (trainees)' },
+        { command: 'missed', description: 'Report absence (trainees)' },
+        { command: 'calendar', description: 'View classes on a date' },
+        { command: 'report', description: 'Get attendance report' },
+        { command: 'weeklyreport', description: 'Generate weekly summary' },
+        { command: 'courseprogress', description: 'View course performance' },
+        { command: 'questionnaire', description: 'Start weekly review' },
+        { command: 'verify', description: 'Verify trainee account' },
+        { command: 'help', description: 'Show help menu' }
+    ]);
+});
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
