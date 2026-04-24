@@ -18,9 +18,12 @@ app.get('/menu', (req, res) => {
     const menuPath = path.join(__dirname, 'public', 'menu.html');
     fs.readFile(menuPath, 'utf8', (err, data) => {
         if (err) {
+            console.error('Error reading menu.html:', err);
             return res.status(500).send('Error loading menu');
         }
-        const updatedData = data.replace(/skillforge_bot/g, process.env.BOT_USERNAME);
+        // Replace hardcoded bot username with the one from environment
+        const updatedData = data.replace(/skillforge_bot/g, BOT_USERNAME_SAFE);
+        res.header('Content-Type', 'text/html; charset=utf-8');
         res.send(updatedData);
     });
 });
@@ -48,11 +51,16 @@ if (missingEnvs.length) {
 }
 
 const BOT_LINK = `https://t.me/${process.env.BOT_USERNAME}?start=verify`;
+const BOT_USERNAME_SAFE = process.env.BOT_USERNAME || 'skillforge_bot';
 const REPORT_CHAT_ID = process.env.REPORT_CHAT_ID || null;
 const SERVER_URL = process.env.SERVER_URL || null;
 const REPORT_LOGO_PATH = process.env.REPORT_LOGO_PATH || './logo.jpg';
 const REPORT_LOGOTAG = process.env.REPORT_LOGOTAG || 'Skillforge Principal Bot';
 const CLASS_TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+// Utility function to generate bot mention
+const getBotMention = () => `@${BOT_USERNAME_SAFE}`;
+const getBotDirectMessageLink = () => `https://t.me/${BOT_USERNAME_SAFE}`;
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -338,7 +346,7 @@ bot.command('claim', async (ctx) => {
 
         const specialistDoc = await db.collection('specialists').doc(specialistId).get();
         if (!specialistDoc.exists) {
-            return ctx.reply('❌ You must be registered as a Specialist first!\n\n📝 Steps:\n1. Go to Direct Message: @skillforge_bot\n2. Type: /register YOUR_PASSWORD\n\nNeed password? Contact your head of units.');
+            return ctx.reply(`❌ You must be registered as a Specialist first!\n\n📝 Steps:\n1. Go to Direct Message: ${getBotMention()}\n2. Type: /register YOUR_PASSWORD\n\nNeed password? Contact your head of units.`);
         }
 
         const specialistData = specialistDoc.data();
