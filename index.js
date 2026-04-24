@@ -1,5 +1,6 @@
 ﻿require('dotenv').config();
 const fs = require('fs');
+const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
 const PDFDocument = require('pdfkit');
 const admin = require('firebase-admin');
@@ -11,6 +12,18 @@ const express = require('express');
 // ==========================================
 const app = express();
 app.use(express.json());
+
+// Route to serve the menu with dynamic bot username
+app.get('/menu', (req, res) => {
+    const menuPath = path.join(__dirname, 'public', 'menu.html');
+    fs.readFile(menuPath, 'utf8', (err, data) => {
+        if (err) {
+            return res.status(500).send('Error loading menu');
+        }
+        const updatedData = data.replace(/skillforge_bot/g, process.env.BOT_USERNAME);
+        res.send(updatedData);
+    });
+});
 
 // SAFELY CONNECT TO FIREBASE
 let serviceAccount;
