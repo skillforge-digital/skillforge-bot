@@ -316,34 +316,52 @@ bot.command('register', async (ctx) => {
 bot.command('claim', async (ctx) => {
     try {
         if (ctx.chat.type === 'private') {
-            return ctx.reply("âŒ You cannot claim a Direct Message! You must type this command inside the actual Skillforge Telegram Group.");
+            return ctx.reply('❌ You cannot claim a Direct Message! You must type this command inside the actual Skillforge Telegram Group.\n\n📍 Go to your Skillforge group → Type /claim');
         }
 
         const specialistId = ctx.from.id.toString();
         const groupId = ctx.chat.id.toString();
-        const groupName = ctx.chat.title || "Skillforge Classroom"; 
+        const groupName = ctx.chat.title || 'Skillforge Classroom';
 
         const specialistDoc = await db.collection('specialists').doc(specialistId).get();
         if (!specialistDoc.exists) {
-            return ctx.reply("âŒ You must be registered as a Specialist first! Go to my Direct Messages and type: /register YOUR_PASSWORD");
+            return ctx.reply('❌ You must be registered as a Specialist first!\n\n📝 Steps:\n1. Go to Direct Message: @skillforge_bot\n2. Type: /register YOUR_PASSWORD\n\nNeed password? Contact your head of units.');
         }
 
         const specialistData = specialistDoc.data();
-        const specialistName = specialistData.name || "Specialist";
+        const specialistName = specialistData.name || 'Specialist';
 
-        await db.collection('classrooms').doc(groupId).set({
+        // Capture group info
+        const groupData = {
             group_id: groupId,
             group_name: groupName,
             specialist_id: specialistId,
-            specialist_name: specialistName
-        });
+            specialist_name: specialistName,
+            claimed_at: admin.firestore.FieldValue.serverTimestamp(),
+            member_count: ctx.chat.members_count || 0
+        };
 
-        ctx.reply(`âœ… Classroom successfully linked!\n\nI have registered this group as **${groupName}** under Specialist **${specialistName}**.\n\nNext, set the first course date with /setprogram ${groupId} YYYY-MM-DD so I can track the 3-week program and performance meter.`);
+        await db.collection('classrooms').doc(groupId).set(groupData);
+
+        // Confirm via inline keyboard with next steps
+        ctx.reply(
+            `✅ *Classroom Successfully Linked!*\n\n` +
+            `📍 *Group:* ${groupName}\n` +
+            `👤 *Specialist:* ${specialistName}\n` +
+            `📊 *Members:* ${ctx.chat.members_count || 'Unknown'}\n\n` +
+            `*Next Step:* Set your course program details`,
+            Markup.inlineKeyboard([
+                [Markup.button.callback('📅 Set Program Date', `setup_program_${groupId}`)],
+                [Markup.button.callback('⏰ Schedule Class', `schedule_${groupId}`)],
+                [Markup.button.url('📖 View Menu', `${SERVER_URL}/menu`)]
+            ])
+        );
+
     } catch (error) {
         await reportError('Claim Error', error);
-        ctx.reply("âŒ An error occurred while trying to claim the group. Please try again.");
+        ctx.reply('❌ An error occurred while claiming the group. Please try again or contact support.');
     }
-});
+})
 
 bot.command('help', (ctx) => {
     const helpText = `*Skillforge Bot Commands*
@@ -1169,6 +1187,83 @@ bot.on('text', async (ctx) => {
 });
 
 // Morning Class Check (Runs every day at 8:00 AM Lagos Time)
+// ==========================================
+// CALLBACK HANDLERS FOR INLINE BUTTONS
+// ==========================================
+
+bot.action('dashboard', (ctx) => {
+    ctx.reply('📋 Dashboard coming soon! Use /status to see your daily overview.');
+});
+
+bot.action('schedule_class', async (ctx) => {
+    const userId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(userId).get();
+    if (!specialistDoc.exists) {
+        return ctx.answerCbQuery('You must be a registered specialist');
+    }
+    ctx.reply('📅 Use /setclass <group_id> <HH:MM> [topic] to schedule a class', { parse_mode: 'Markdown' });
+});
+
+bot.action('submit_report', (ctx) => {
+    const today = new Date();
+    if (today.getDay() !== 6) {
+        return ctx.answerCbQuery('Reports can only be submitted on Saturdays!');
+    }
+    ctx.reply('📝 Starting weekly report. Use /weeklyreport or click the button below:', 
+        Markup.inlineKeyboard([
+            [Markup.button.callback('Start Report Now', 'start_report')]
+        ])
+    );
+});
+
+bot.action('start_report', async (ctx) => {
+    const userId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(userId).get();
+    if (!specialistDoc.exists) {
+        return ctx.answerCbQuery('Registration required');
+    }
+    ctx.reply('📊 Weekly Report started. Please answer the questions...');
+});
+
+bot.action('help_info', (ctx) => {
+    ctx.reply(
+        `*📚 Skillforge Bot Help*\n\n` +
+        `*Key Commands:*\n` +
+        `📝 /register - Register as specialist\n` +
+        `🏢 /claim - Link your classroom\n` +
+        `📅 /setclass - Schedule class\n` +
+        `📊 /weeklyreport - Submit report\n` +
+        `❓ /help - Full help menu\n\n` +
+        `*Need More Help?*\n` +
+        `Contact: support@skillforge.com`,
+        { parse_mode: 'Markdown' }
+    );
+    ctx.answerCbQuery('Help opened');
+});
+
+bot.action(/^setup_program_(.+)$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    ctx.reply(
+        `📅 *Setup Program Date*\n\n` +
+        `Please reply with the start date in format: YYYY-MM-DD\n\n` +
+        `Example: 2026-04-24`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+bot.action(/^schedule_(.+)$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    ctx.reply(
+        `⏰ *Schedule Class*\n\n` +
+        `Please provide:\n` +
+        `• Time in HH:MM format (24-hour)\n` +
+        `• Optional topic\n\n` +
+        `Example: 14:30 Introduction to Node.js`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+
 cron.schedule('0 8 * * *', async () => {
     const classroomsSnapshot = await db.collection('classrooms').get();
     if (classroomsSnapshot.empty) return;
@@ -1571,7 +1666,7 @@ bot.start(async (ctx) => {
         const doc = await userRef.get();
 
         if (!doc.exists) return ctx.reply("I couldn't find your record. Have you joined a Skillforge group yet?");
-        if (doc.data().verified) return ctx.reply("You are already verified! ðŸŽ“");
+        if (doc.data().verified) return ctx.reply("You are already verified! 🎓");
 
         await userRef.update({ verified: true, timed_out: false });
 
@@ -1583,22 +1678,41 @@ bot.start(async (ctx) => {
             console.log("Permission restore error:", error.message);
         }
 
-        ctx.reply("Verification successful! âœ… You now have full access.");
+        ctx.reply("Verification successful! ✅ You now have full access.");
     } else {
         // Check if registered specialist
         const specialistDoc = await db.collection('specialists').doc(userId).get();
         if (specialistDoc.exists) {
-            // Show menu for specialists
-            ctx.reply("Welcome back, Specialist! Choose an option:", Markup.keyboard([
-                ['Submit Weekly Report', 'Schedule Class'],
-                ['View My Classes', 'View Reports'],
-                ['Help', 'Settings']
-            ]).resize());
+            const specialistData = specialistDoc.data();
+            // Show menu for specialists with improved UI
+            ctx.reply(
+                `*👋 Welcome back, ${specialistData.name || 'Specialist'}!*\n\n` +
+                `Select an option below to get started:`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('📋 Dashboard', 'dashboard')],
+                    [Markup.button.callback('📅 Schedule Class', 'schedule_class')],
+                    [Markup.button.callback('📊 Submit Report', 'submit_report')],
+                    [Markup.button.url('🌐 Full Menu', `${SERVER_URL}/menu`)],
+                    [Markup.button.callback('❓ Help', 'help_info')]
+                ])
+            );
         } else {
-            ctx.reply("Welcome! If you are a Specialist, use /register [password]. If you are a trainee, use the verify button in your main group.");
+            ctx.reply(
+                `*Welcome to Skillforge Bot!* 🎓\n\n` +
+                `I'm your classroom management assistant.\n\n` +
+                `*For Specialists:*\n` +
+                `📝 Use /register [password] to register\n\n` +
+                `*For Trainees:*\n` +
+                `✅ Join a group to verify your account\n\n` +
+                `🌐 View the full menu below:`,
+                Markup.inlineKeyboard([
+                    [Markup.button.url('📖 Open Menu', `${SERVER_URL}/menu`)],
+                    [Markup.button.callback('❓ Help', 'help_info')]
+                ])
+            );
         }
     }
-});
+})
 
 // Menu handlers
 bot.hears('Submit Weekly Report', async (ctx) => {
@@ -1802,7 +1916,11 @@ cron.schedule('*/30 * * * *', async () => {
 // MODULE 3: SERVER START
 // ==========================================
 
-app.get('/', (req, res) => res.send('Skillforge Principal Bot is running!'));
+app.use(express.static('public'));
+
+app.get('/', (req, res) => res.sendFile(__dirname + '/public/menu.html'));
+
+app.get('/menu', (req, res) => res.sendFile(__dirname + '/public/menu.html'));
 
 app.get('/questionnaire', async (req, res) => {
     try {
