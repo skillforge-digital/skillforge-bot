@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const fs = require('fs');
 const { Telegraf, Markup } = require('telegraf');
 const PDFDocument = require('pdfkit');
@@ -10,6 +10,7 @@ const express = require('express');
 // SETUP & CONNECTIONS
 // ==========================================
 const app = express();
+app.use(express.json());
 
 // SAFELY CONNECT TO FIREBASE
 let serviceAccount;
@@ -46,7 +47,7 @@ const getClassDocId = (groupId, date, time) => `${groupId}_${date}_${time}`;
 const normalizeUserIds = (userIds) => [...new Set(userIds.filter(Boolean).map(String))];
 
 const reportError = async (message, error) => {
-    const fullMessage = `❗️ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`;
+    const fullMessage = `â—ï¸ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`;
     console.error(fullMessage);
     if (REPORT_CHAT_ID) {
         try {
@@ -239,13 +240,13 @@ const buildReviewPdf = async (session) => {
     lines.push(`Review period: ${session.week_start} to ${session.week_end}`);
     lines.push('');
     lines.push('Performance Summary:');
-    lines.push(`• Sessions held: ${session.performance?.heldSessions ?? 0}/${session.performance?.expectedSessions ?? 0}`);
-    lines.push(`• Active class days: ${session.performance?.classDays ?? 0}/${session.performance?.expectedDays ?? 0}`);
-    lines.push(`• Attendance rate: ${session.performance?.attendanceRate ?? 0}%`);
-    lines.push(`• Performance meter: ${session.performance?.meterValue ?? 0}/100`);
-    lines.push(`• Target plan: ${session.sessions_per_week || 3} sessions per week, minimum ${session.min_days_per_week || 2} days per week, ${session.expected_duration_minutes || 45} minutes per session.`);
+    lines.push(`â€¢ Sessions held: ${session.performance?.heldSessions ?? 0}/${session.performance?.expectedSessions ?? 0}`);
+    lines.push(`â€¢ Active class days: ${session.performance?.classDays ?? 0}/${session.performance?.expectedDays ?? 0}`);
+    lines.push(`â€¢ Attendance rate: ${session.performance?.attendanceRate ?? 0}%`);
+    lines.push(`â€¢ Performance meter: ${session.performance?.meterValue ?? 0}/100`);
+    lines.push(`â€¢ Target plan: ${session.sessions_per_week || 3} sessions per week, minimum ${session.min_days_per_week || 2} days per week, ${session.expected_duration_minutes || 45} minutes per session.`);
     if (session.rating) {
-        lines.push(`• Trainee participation rating: ${session.rating}/5`);
+        lines.push(`â€¢ Trainee participation rating: ${session.rating}/5`);
     }
     lines.push('');
     lines.push('Review Answers:');
@@ -293,7 +294,7 @@ bot.command('register', async (ctx) => {
         const password = messageText[1];
 
         if (password !== process.env.STAFF_PASSWORD) {
-            return ctx.reply("❌ Invalid Skillforge master password.");
+            return ctx.reply("âŒ Invalid Skillforge master password.");
         }
 
         const specialistId = ctx.from.id.toString();
@@ -305,17 +306,17 @@ bot.command('register', async (ctx) => {
             registered_at: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        ctx.reply(`✅ Welcome to the team, Specialist ${specialistName}! \n\nYou are now authorized. Please go to your cohort's Telegram group, add me as an Admin, and type /claim to link the classroom.`);
+        ctx.reply(`âœ… Welcome to the team, Specialist ${specialistName}! \n\nYou are now authorized. Please go to your cohort's Telegram group, add me as an Admin, and type /claim to link the classroom.`);
     } catch (error) {
         console.log("Register Error:", error);
-        ctx.reply("❌ An error occurred during registration.");
+        ctx.reply("âŒ An error occurred during registration.");
     }
 });
 
 bot.command('claim', async (ctx) => {
     try {
         if (ctx.chat.type === 'private') {
-            return ctx.reply("❌ You cannot claim a Direct Message! You must type this command inside the actual Skillforge Telegram Group.");
+            return ctx.reply("âŒ You cannot claim a Direct Message! You must type this command inside the actual Skillforge Telegram Group.");
         }
 
         const specialistId = ctx.from.id.toString();
@@ -324,7 +325,7 @@ bot.command('claim', async (ctx) => {
 
         const specialistDoc = await db.collection('specialists').doc(specialistId).get();
         if (!specialistDoc.exists) {
-            return ctx.reply("❌ You must be registered as a Specialist first! Go to my Direct Messages and type: /register YOUR_PASSWORD");
+            return ctx.reply("âŒ You must be registered as a Specialist first! Go to my Direct Messages and type: /register YOUR_PASSWORD");
         }
 
         const specialistData = specialistDoc.data();
@@ -337,10 +338,10 @@ bot.command('claim', async (ctx) => {
             specialist_name: specialistName
         });
 
-        ctx.reply(`✅ Classroom successfully linked!\n\nI have registered this group as **${groupName}** under Specialist **${specialistName}**.\n\nNext, set the first course date with /setprogram ${groupId} YYYY-MM-DD so I can track the 3-week program and performance meter.`);
+        ctx.reply(`âœ… Classroom successfully linked!\n\nI have registered this group as **${groupName}** under Specialist **${specialistName}**.\n\nNext, set the first course date with /setprogram ${groupId} YYYY-MM-DD so I can track the 3-week program and performance meter.`);
     } catch (error) {
         await reportError('Claim Error', error);
-        ctx.reply("❌ An error occurred while trying to claim the group. Please try again.");
+        ctx.reply("âŒ An error occurred while trying to claim the group. Please try again.");
     }
 });
 
@@ -348,43 +349,43 @@ bot.command('help', (ctx) => {
     const helpText = `*Skillforge Bot Commands*
 
 ` +
-        `• /register <password> - Register as a Specialist.
+        `â€¢ /register <password> - Register as a Specialist.
 ` +
-        `• /claim - Claim your Telegram classroom group.
+        `â€¢ /claim - Claim your Telegram classroom group.
 ` +
-        `• /setclass <group_id> <HH:MM> [topic] - Schedule today’s live session with optional topic.
+        `â€¢ /setclass <group_id> <HH:MM> [topic] - Schedule todayâ€™s live session with optional topic.
 ` +
-        `• /rescheduleclass <group_id> <old_time> <new_time> - Move a session to a new time.
+        `â€¢ /rescheduleclass <group_id> <old_time> <new_time> - Move a session to a new time.
 ` +
-        `• /cancelclass <group_id> [time] - Cancel one or all today’s sessions.
+        `â€¢ /cancelclass <group_id> [time] - Cancel one or all todayâ€™s sessions.
 ` +
-        `• /classlist - Show all upcoming live sessions for your classrooms.
+        `â€¢ /classlist - Show all upcoming live sessions for your classrooms.
 ` +
-        `• /status - Show your classroom status and today’s schedule.
+        `â€¢ /status - Show your classroom status and todayâ€™s schedule.
 ` +
-        `• /health - Check bot health and system status.
+        `â€¢ /health - Check bot health and system status.
 ` +
-        `• /attended - Confirm attendance for the current session (in DM).
+        `â€¢ /attended - Confirm attendance for the current session (in DM).
 ` +
-        `• /missed - Report missing the current session (in DM).
+        `â€¢ /missed - Report missing the current session (in DM).
 ` +
-        `• /backup <group_name> - Assign yourself as backup specialist.
+        `â€¢ /backup <group_name> - Assign yourself as backup specialist.
 ` +
-        `• /calendar [date] - List classes for a date (YYYY-MM-DD).
+        `â€¢ /calendar [date] - List classes for a date (YYYY-MM-DD).
 ` +
-        `• /report [date] - Get attendance report for your classes.
+        `â€¢ /report [date] - Get attendance report for your classes.
 ` +
-        `• /weeklyreport - Generate weekly summary report (Saturdays only).
+        `â€¢ /weeklyreport - Generate weekly summary report (Saturdays only).
 ` +
-        `• /setprogram <group_id> <YYYY-MM-DD> - Define course first class date and tracking plan.
+        `â€¢ /setprogram <group_id> <YYYY-MM-DD> - Define course first class date and tracking plan.
 ` +
-        `• /courseprogress <group_id> - Show weekly performance meter and plan progress.
+        `â€¢ /courseprogress <group_id> - Show weekly performance meter and plan progress.
 ` +
-        `• /questionnaire - Download the staff questionnaire PDF.
+        `â€¢ /questionnaire - Download the staff questionnaire PDF.
 ` +
-        `• /verify - Verify your trainee account in private chat.
+        `â€¢ /verify - Verify your trainee account in private chat.
 ` +
-        `• /help - Show this message.`;
+        `â€¢ /help - Show this message.`;
     ctx.reply(helpText, { parse_mode: 'Markdown' });
 });
 
@@ -410,7 +411,7 @@ bot.command('status', async (ctx) => {
             } else {
                 for (const classDoc of classesSnapshot.docs) {
                     const classData = classDoc.data();
-                    response += `\n• ${classData.group_name} at *${classData.time}*`;
+                    response += `\nâ€¢ ${classData.group_name} at *${classData.time}*`;
                 }
             }
 
@@ -441,7 +442,7 @@ bot.command('status', async (ctx) => {
         } else {
             for (const classDoc of classesSnapshot.docs) {
                 const classData = classDoc.data();
-                response += `\n• Live class at *${classData.time}*`;
+                response += `\nâ€¢ Live class at *${classData.time}*`;
             }
         }
 
@@ -454,7 +455,7 @@ bot.command('status', async (ctx) => {
         ctx.reply(response, { parse_mode: 'Markdown' });
     } catch (error) {
         await reportError('Status command failed', error);
-        ctx.reply('❌ Unable to fetch status right now. Please try again later.');
+        ctx.reply('âŒ Unable to fetch status right now. Please try again later.');
     }
 });
 
@@ -492,14 +493,14 @@ bot.command('classlist', async (ctx) => {
                     response += `\n**${currentDate}**`;
                 }
                 const topic = classData.topic ? ` - ${classData.topic}` : '';
-                response += `\n• ${classData.group_name} at *${classData.time}*${topic}`;
+                response += `\nâ€¢ ${classData.group_name} at *${classData.time}*${topic}`;
             }
         }
 
         ctx.reply(response, { parse_mode: 'Markdown' });
     } catch (error) {
         await reportError('classlist command failed', error);
-        ctx.reply('❌ Unable to fetch class list right now. Please try again later.');
+        ctx.reply('âŒ Unable to fetch class list right now. Please try again later.');
     }
 });
 
@@ -530,16 +531,16 @@ bot.command('health', async (ctx) => {
         const uptimeStr = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`;
 
         let response = `*Bot Health Status*\n\n`;
-        response += `• Uptime: ${uptimeStr}\n`;
-        response += `• Today's Classes: ${totalClasses}\n`;
-        response += `• Pending Verifications: ${totalPending}\n`;
-        response += `• Timezone: Africa/Lagos\n`;
-        response += `• Status: ✅ Operational`;
+        response += `â€¢ Uptime: ${uptimeStr}\n`;
+        response += `â€¢ Today's Classes: ${totalClasses}\n`;
+        response += `â€¢ Pending Verifications: ${totalPending}\n`;
+        response += `â€¢ Timezone: Africa/Lagos\n`;
+        response += `â€¢ Status: âœ… Operational`;
 
         ctx.reply(response, { parse_mode: 'Markdown' });
     } catch (error) {
         await reportError('Health command failed', error);
-        ctx.reply('❌ Unable to check health right now.');
+        ctx.reply('âŒ Unable to check health right now.');
     }
 });
 
@@ -581,7 +582,7 @@ bot.command('attended', async (ctx) => {
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    ctx.reply(`✅ Attendance confirmed for **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`);
+    ctx.reply(`âœ… Attendance confirmed for **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`);
 });
 
 bot.command('missed', async (ctx) => {
@@ -620,7 +621,7 @@ bot.command('missed', async (ctx) => {
         timestamp: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    ctx.reply(`📝 Noted that you missed **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`);
+    ctx.reply(`ðŸ“ Noted that you missed **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`);
 });
 
 // Assign Backup Specialist
@@ -654,7 +655,7 @@ bot.command('backup', async (ctx) => {
         backup_specialist_id: userId // For now, self-assign as backup, but can be extended
     });
 
-    ctx.reply(`✅ Backup specialist assigned for **${groupName}**.`);
+    ctx.reply(`âœ… Backup specialist assigned for **${groupName}**.`);
 });
 
 // Calendar: List classes for a specific date
@@ -674,10 +675,10 @@ bot.command('calendar', async (ctx) => {
         return ctx.reply(`No classes scheduled for ${dateStr}.`);
     }
 
-    let response = `📅 **Classes on ${dateStr}**\n\n`;
+    let response = `ðŸ“… **Classes on ${dateStr}**\n\n`;
     classesSnapshot.forEach(doc => {
         const data = doc.data();
-        response += `🕒 ${data.time} - ${data.group_name}${data.topic ? ` (${data.topic})` : ''}\n`;
+        response += `ðŸ•’ ${data.time} - ${data.group_name}${data.topic ? ` (${data.topic})` : ''}\n`;
     });
 
     ctx.reply(response, { parse_mode: 'Markdown' });
@@ -708,7 +709,7 @@ bot.command('report', async (ctx) => {
         return ctx.reply(`No classes found for ${dateStr}.`);
     }
 
-    let response = `📊 **Attendance Report for ${dateStr}**\n\n`;
+    let response = `ðŸ“Š **Attendance Report for ${dateStr}**\n\n`;
     for (const doc of classesSnapshot.docs) {
         const classData = doc.data();
         const attendanceSnapshot = await db.collection('attendance')
@@ -795,34 +796,34 @@ bot.command('weeklyreport', async (ctx) => {
     const attendanceRate = totalPossibleAttendance > 0 ? ((totalAttendance / totalPossibleAttendance) * 100).toFixed(1) : 0;
 
     // Generate report
-    let report = `📊 **Weekly Report for ${specialistDoc.data().name}**\n`;
+    let report = `ðŸ“Š **Weekly Report for ${specialistDoc.data().name}**\n`;
     report += `Period: ${mondayStr} to ${sundayStr}\n\n`;
-    report += `📅 **Class Statistics**\n`;
-    report += `• Classes Scheduled: ${totalScheduled}\n`;
-    report += `• Classes Held: ${totalHeld}\n`;
-    report += `• Classes Missed: ${totalScheduled - totalHeld}\n\n`;
-    report += `👥 **Attendance Overview**\n`;
-    report += `• Total Attendance: ${totalAttendance}/${totalPossibleAttendance}\n`;
-    report += `• Attendance Rate: ${attendanceRate}%\n\n`;
-    report += `🎯 **Program Tracking Note**\n`;
-    report += `• Target: 3 sessions per week, at least 2 unique class days, 45 minutes per session.\n`;
-    report += `• Use /courseprogress <group_id> for the course performance meter and detailed weekly status.\n\n`;
+    report += `ðŸ“… **Class Statistics**\n`;
+    report += `â€¢ Classes Scheduled: ${totalScheduled}\n`;
+    report += `â€¢ Classes Held: ${totalHeld}\n`;
+    report += `â€¢ Classes Missed: ${totalScheduled - totalHeld}\n\n`;
+    report += `ðŸ‘¥ **Attendance Overview**\n`;
+    report += `â€¢ Total Attendance: ${totalAttendance}/${totalPossibleAttendance}\n`;
+    report += `â€¢ Attendance Rate: ${attendanceRate}%\n\n`;
+    report += `ðŸŽ¯ **Program Tracking Note**\n`;
+    report += `â€¢ Target: 3 sessions per week, at least 2 unique class days, 45 minutes per session.\n`;
+    report += `â€¢ Use /courseprogress <group_id> for the course performance meter and detailed weekly status.\n\n`;
 
     if (feedbackList.length > 0) {
-        report += `📝 **Feedback Summary**\n`;
+        report += `ðŸ“ **Feedback Summary**\n`;
         report += `Total Feedback Received: ${feedbackList.length}\n\n`;
         // Simple sentiment analysis (count ratings)
         const ratings = feedbackList.filter(f => /\b[1-5]\b/.test(f)).map(f => parseInt(f.match(/\b[1-5]\b/)[0]));
         if (ratings.length > 0) {
             const avgRating = (ratings.reduce((a,b)=>a+b,0) / ratings.length).toFixed(1);
-            report += `Average Rating: ${avgRating}/5 ⭐\n\n`;
+            report += `Average Rating: ${avgRating}/5 â­\n\n`;
         }
         report += `Recent Comments:\n`;
         feedbackList.slice(-5).forEach((fb, i) => {
             report += `${i+1}. ${fb.length > 100 ? fb.substring(0,100)+'...' : fb}\n`;
         });
     } else {
-        report += `📝 No feedback received this week.\n`;
+        report += `ðŸ“ No feedback received this week.\n`;
     }
 
     report += `\n--- End of Report ---\n`;
@@ -878,7 +879,7 @@ bot.command('setprogram', async (ctx) => {
         expected_total_sessions: weeks * sessionsPerWeek
     });
 
-    ctx.reply(`✅ Course program saved for **${room.group_name}**.\nStart Date: ${dateToString(startDate)}\nEnd Date: ${dateToString(endDate)}\nExpected: ${sessionsPerWeek} sessions per week, ${expectedDurationMinutes} minutes each, for ${weeks} weeks.`);
+    ctx.reply(`âœ… Course program saved for **${room.group_name}**.\nStart Date: ${dateToString(startDate)}\nEnd Date: ${dateToString(endDate)}\nExpected: ${sessionsPerWeek} sessions per week, ${expectedDurationMinutes} minutes each, for ${weeks} weeks.`);
 });
 
 bot.command('courseprogress', async (ctx) => {
@@ -915,25 +916,25 @@ bot.command('courseprogress', async (ctx) => {
     const weekBounds = getWeekBounds(today);
     const performance = await getWeekPerformance(groupId, weekBounds.monday, weekBounds.sunday, room);
 
-    let response = `📈 **Course Progress for ${room.group_name}**\n`;
-    response += `• Course start: ${room.course_start_date}\n`;
-    response += `• Course end: ${room.course_end_date}\n`;
-    response += `• Status: ${statusLabel}\n\n`;
+    let response = `ðŸ“ˆ **Course Progress for ${room.group_name}**\n`;
+    response += `â€¢ Course start: ${room.course_start_date}\n`;
+    response += `â€¢ Course end: ${room.course_end_date}\n`;
+    response += `â€¢ Status: ${statusLabel}\n\n`;
     response += `**Weekly Performance Meter**\n`;
-    response += `• Sessions held this week: ${performance.heldSessions}/${performance.expectedSessions}\n`;
-    response += `• Active class days this week: ${performance.classDays}/${performance.expectedDays}\n`;
-    response += `• Attendance rate: ${performance.attendanceRate}%\n`;
-    response += `• Performance meter: ${performance.meterValue}/100\n\n`;
+    response += `â€¢ Sessions held this week: ${performance.heldSessions}/${performance.expectedSessions}\n`;
+    response += `â€¢ Active class days this week: ${performance.classDays}/${performance.expectedDays}\n`;
+    response += `â€¢ Attendance rate: ${performance.attendanceRate}%\n`;
+    response += `â€¢ Performance meter: ${performance.meterValue}/100\n\n`;
     response += `**Plan targets**\n`;
-    response += `• ${sessionsPerWeek} classes per week\n`;
-    response += `• Minimum ${minDaysPerWeek} class days per week\n`;
-    response += `• ${room.expected_duration_minutes || 45} minutes per session\n`;
-    response += `• Total planned sessions: ${room.expected_total_sessions || weeks * sessionsPerWeek}\n`;
+    response += `â€¢ ${sessionsPerWeek} classes per week\n`;
+    response += `â€¢ Minimum ${minDaysPerWeek} class days per week\n`;
+    response += `â€¢ ${room.expected_duration_minutes || 45} minutes per session\n`;
+    response += `â€¢ Total planned sessions: ${room.expected_total_sessions || weeks * sessionsPerWeek}\n`;
 
     if (isStarted) {
-        response += `\n✅ The course has officially started.`;
+        response += `\nâœ… The course has officially started.`;
     } else {
-        response += `\n⏳ The course has not started yet. First class is scheduled for ${room.course_start_date}.`;
+        response += `\nâ³ The course has not started yet. First class is scheduled for ${room.course_start_date}.`;
     }
 
     ctx.reply(response, { parse_mode: 'Markdown' });
@@ -966,7 +967,7 @@ bot.command('questionnaire', async (ctx) => {
             let listResponse = 'You have multiple classroom groups. Please run /questionnaire <group_id> with one of these group IDs:\n';
             groupsSnapshot.docs.forEach(doc => {
                 const room = doc.data();
-                listResponse += `• ${room.group_name}: ${doc.id}\n`;
+                listResponse += `â€¢ ${room.group_name}: ${doc.id}\n`;
             });
             return ctx.reply(listResponse);
         }
@@ -1006,7 +1007,7 @@ bot.command('questionnaire', async (ctx) => {
         updated_at: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    const message = `📋 Weekly review ready for *${room.group_name}*\nPeriod: *${dateToString(weekBounds.monday)}* to *${dateToString(weekBounds.sunday)}*\n\nAre you ready to take your weekly review?`;
+    const message = `ðŸ“‹ Weekly review ready for *${room.group_name}*\nPeriod: *${dateToString(weekBounds.monday)}* to *${dateToString(weekBounds.sunday)}*\n\nAre you ready to take your weekly review?`;
     await ctx.reply(message, {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([Markup.button.callback('Yes, start review', `review_start_${sessionId}`)])
@@ -1131,7 +1132,7 @@ bot.on('text', async (ctx) => {
         const completedSession = { id: sessionId, ...session, ...completedPayload };
         const pdfBuffer = await buildReviewPdf(completedSession);
 
-        await ctx.reply('✅ Weekly review completed! Generating your PDF now...');
+        await ctx.reply('âœ… Weekly review completed! Generating your PDF now...');
         await ctx.replyWithDocument({ source: pdfBuffer, filename: `weekly_review_${session.group_name}_${session.week_start}_to_${session.week_end}.pdf` });
         if (SERVER_URL) {
             await ctx.reply(`You can also download it again here:\n${SERVER_URL}/review/${sessionId}`);
@@ -1162,7 +1163,7 @@ bot.on('text', async (ctx) => {
                 feedback: messageText,
                 timestamp: admin.firestore.FieldValue.serverTimestamp()
             });
-            ctx.reply('✅ Thank you for your feedback!');
+            ctx.reply('âœ… Thank you for your feedback!');
         }
     }
 });
@@ -1174,7 +1175,7 @@ cron.schedule('0 8 * * *', async () => {
 
     classroomsSnapshot.forEach(async (doc) => {
         const room = doc.data();
-        const message = `Good morning Specialist ${room.specialist_name}! ☀️\n\nWill there be a live session for **${room.group_name}** today?\n\nIf yes, set the time using:\n\n\`/setclass ${room.group_id} 14:00\``;
+        const message = `Good morning Specialist ${room.specialist_name}! â˜€ï¸\n\nWill there be a live session for **${room.group_name}** today?\n\nIf yes, set the time using:\n\n\`/setclass ${room.group_id} 14:00\``;
         
         try {
             await bot.telegram.sendMessage(room.specialist_id, message, { parse_mode: 'Markdown' });
@@ -1192,26 +1193,26 @@ bot.command('setclass', async (ctx) => {
         const topic = args.slice(3).join(' ') || null;
 
         if (!groupId || !timeInput) {
-            return ctx.reply("❌ Format error. Please use: /setclass <group_id> <time> [topic]\nExample: /setclass -100123456 14:00 Introduction to JavaScript");
+            return ctx.reply("âŒ Format error. Please use: /setclass <group_id> <time> [topic]\nExample: /setclass -100123456 14:00 Introduction to JavaScript");
         }
 
         if (!CLASS_TIME_REGEX.test(timeInput)) {
-            return ctx.reply("❌ Time format should be HH:MM in 24-hour format. Example: /setclass -100123456 14:00");
+            return ctx.reply("âŒ Time format should be HH:MM in 24-hour format. Example: /setclass -100123456 14:00");
         }
 
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) {
-            return ctx.reply("❌ That group is not linked to a classroom. Have the Specialist claim the group first.");
+            return ctx.reply("âŒ That group is not linked to a classroom. Have the Specialist claim the group first.");
         }
 
         const room = roomDoc.data();
         const specialistId = ctx.from.id.toString();
         if (specialistId !== room.specialist_id) {
-            return ctx.reply("❌ Only the linked Specialist can schedule this group.");
+            return ctx.reply("âŒ Only the linked Specialist can schedule this group.");
         }
 
         if (!room.course_start_date) {
-            await ctx.reply(`⚠️ I recommend setting the first course date for this group with:\n/setprogram ${groupId} YYYY-MM-DD\nThis allows the performance meter and weekly tracking to work correctly.`);
+            await ctx.reply(`âš ï¸ I recommend setting the first course date for this group with:\n/setprogram ${groupId} YYYY-MM-DD\nThis allows the performance meter and weekly tracking to work correctly.`);
         }
 
         const todayStr = getLagosDateString();
@@ -1233,7 +1234,7 @@ bot.command('setclass', async (ctx) => {
         });
 
         const topicText = topic ? `\n\n**Topic:** ${topic}` : '';
-        const announcementText = `📢 **Live Session Scheduled**\n\nA live session for **${room.group_name}** is confirmed at **${timeInput}** today.${topicText}\n\nI will pin this announcement and send personal reminders to the Specialist and verified trainees at 30, 15, and 5 minutes before class.`;
+        const announcementText = `ðŸ“¢ **Live Session Scheduled**\n\nA live session for **${room.group_name}** is confirmed at **${timeInput}** today.${topicText}\n\nI will pin this announcement and send personal reminders to the Specialist and verified trainees at 30, 15, and 5 minutes before class.`;
         try {
             const sentMessage = await ctx.telegram.sendMessage(groupId, announcementText, { parse_mode: 'Markdown' });
             await ctx.telegram.pinChatMessage(groupId, sentMessage.message_id, { disable_notification: true });
@@ -1241,14 +1242,14 @@ bot.command('setclass', async (ctx) => {
             await reportError('Could not announce or pin the class message', error);
         }
 
-        ctx.reply(`✅ Locked in! Class for **${room.group_name}** is set for ${timeInput} today. I have announced it and will send reminders. 🚀`, { parse_mode: 'Markdown' });
+        ctx.reply(`âœ… Locked in! Class for **${room.group_name}** is set for ${timeInput} today. I have announced it and will send reminders. ðŸš€`, { parse_mode: 'Markdown' });
 
         const verifiedTrainees = await getVerifiedTraineeIds(groupId);
-        const reminderText = `✅ Live session for **${room.group_name}** is scheduled at **${timeInput}** today.${topic ? ` Topic: ${topic}` : ''} I will remind you 30, 15, and 5 minutes before the class.`;
+        const reminderText = `âœ… Live session for **${room.group_name}** is scheduled at **${timeInput}** today.${topic ? ` Topic: ${topic}` : ''} I will remind you 30, 15, and 5 minutes before the class.`;
         await sendDmUsers(normalizeUserIds([room.specialist_id, ...verifiedTrainees]), reminderText, { parse_mode: 'Markdown' });
     } catch (error) {
         await reportError('setclass command failed', error);
-        ctx.reply('❌ Failed to schedule the class. Please try again.');
+        ctx.reply('âŒ Failed to schedule the class. Please try again.');
     }
 });
 
@@ -1259,18 +1260,18 @@ bot.command('cancelclass', async (ctx) => {
         const timeInput = args[2];
 
         if (!groupId) {
-            return ctx.reply("❌ Format error. Please use: /cancelclass <group_id> [time]\nExample: /cancelclass -100123456 14:00");
+            return ctx.reply("âŒ Format error. Please use: /cancelclass <group_id> [time]\nExample: /cancelclass -100123456 14:00");
         }
 
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) {
-            return ctx.reply('❌ That group is not linked to a classroom.');
+            return ctx.reply('âŒ That group is not linked to a classroom.');
         }
 
         const room = roomDoc.data();
         const specialistId = ctx.from.id.toString();
         if (specialistId !== room.specialist_id) {
-            return ctx.reply('❌ Only the linked Specialist can cancel the class.');
+            return ctx.reply('âŒ Only the linked Specialist can cancel the class.');
         }
 
         const todayStr = getLagosDateString();
@@ -1278,12 +1279,12 @@ bot.command('cancelclass', async (ctx) => {
 
         if (timeInput) {
             if (!CLASS_TIME_REGEX.test(timeInput)) {
-                return ctx.reply('❌ Time format should be HH:MM in 24-hour format.');
+                return ctx.reply('âŒ Time format should be HH:MM in 24-hour format.');
             }
             const classId = getClassDocId(groupId, todayStr, timeInput);
             const classDoc = await db.collection('classes').doc(classId).get();
             if (!classDoc.exists || classDoc.data().status !== 'active') {
-                return ctx.reply('❌ No active class scheduled at that time.');
+                return ctx.reply('âŒ No active class scheduled at that time.');
             }
             await db.collection('classes').doc(classId).update({ status: 'canceled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
             canceledCount = 1;
@@ -1294,7 +1295,7 @@ bot.command('cancelclass', async (ctx) => {
                 .where('status', '==', 'active')
                 .get();
             if (snapshot.empty) {
-                return ctx.reply('❌ No active classes scheduled for today to cancel.');
+                return ctx.reply('âŒ No active classes scheduled for today to cancel.');
             }
             for (const classDoc of snapshot.docs) {
                 await db.collection('classes').doc(classDoc.id).update({ status: 'canceled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
@@ -1302,12 +1303,12 @@ bot.command('cancelclass', async (ctx) => {
             }
         }
 
-        const cancelMessage = `⚠️ The live session${timeInput ? ` at ${timeInput}` : ''} for **${room.group_name}** has been canceled.`;
+        const cancelMessage = `âš ï¸ The live session${timeInput ? ` at ${timeInput}` : ''} for **${room.group_name}** has been canceled.`;
         await ctx.telegram.sendMessage(groupId, cancelMessage, { parse_mode: 'Markdown' });
-        ctx.reply(`✅ Canceled ${canceledCount} scheduled class(es).`);
+        ctx.reply(`âœ… Canceled ${canceledCount} scheduled class(es).`);
     } catch (error) {
         await reportError('cancelclass command failed', error);
-        ctx.reply('❌ Failed to cancel the class. Please try again.');
+        ctx.reply('âŒ Failed to cancel the class. Please try again.');
     }
 });
 
@@ -1319,39 +1320,39 @@ bot.command('rescheduleclass', async (ctx) => {
         const newTime = args[3];
 
         if (!groupId || !oldTime || !newTime) {
-            return ctx.reply('❌ Format error. Please use: /rescheduleclass <group_id> <old_time> <new_time>\nExample: /rescheduleclass -100123456 14:00 15:00');
+            return ctx.reply('âŒ Format error. Please use: /rescheduleclass <group_id> <old_time> <new_time>\nExample: /rescheduleclass -100123456 14:00 15:00');
         }
 
         if (!CLASS_TIME_REGEX.test(oldTime) || !CLASS_TIME_REGEX.test(newTime)) {
-            return ctx.reply('❌ Time format should be HH:MM in 24-hour format.');
+            return ctx.reply('âŒ Time format should be HH:MM in 24-hour format.');
         }
 
         if (oldTime === newTime) {
-            return ctx.reply('⚠️ The new time must be different from the old time.');
+            return ctx.reply('âš ï¸ The new time must be different from the old time.');
         }
 
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) {
-            return ctx.reply('❌ That group is not linked to a classroom.');
+            return ctx.reply('âŒ That group is not linked to a classroom.');
         }
 
         const room = roomDoc.data();
         const specialistId = ctx.from.id.toString();
         if (specialistId !== room.specialist_id) {
-            return ctx.reply('❌ Only the linked Specialist can reschedule this class.');
+            return ctx.reply('âŒ Only the linked Specialist can reschedule this class.');
         }
 
         const todayStr = getLagosDateString();
         const oldClassId = getClassDocId(groupId, todayStr, oldTime);
         const oldClassDoc = await db.collection('classes').doc(oldClassId).get();
         if (!oldClassDoc.exists || oldClassDoc.data().status !== 'active') {
-            return ctx.reply('❌ No active class exists at the old time.');
+            return ctx.reply('âŒ No active class exists at the old time.');
         }
 
         const newClassId = getClassDocId(groupId, todayStr, newTime);
         const existingNewClass = await db.collection('classes').doc(newClassId).get();
         if (existingNewClass.exists && existingNewClass.data().status === 'active') {
-            return ctx.reply('❌ A class is already scheduled at the new time.');
+            return ctx.reply('âŒ A class is already scheduled at the new time.');
         }
 
         await db.collection('classes').doc(oldClassId).update({ status: 'rescheduled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
@@ -1370,7 +1371,7 @@ bot.command('rescheduleclass', async (ctx) => {
             created_at: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        const announcementText = `🔄 **Class Rescheduled**\n\nThe live session for **${room.group_name}** has been moved from **${oldTime}** to **${newTime}** today.${oldClassDoc.data().topic ? `\n\n**Topic:** ${oldClassDoc.data().topic}` : ''}`;
+        const announcementText = `ðŸ”„ **Class Rescheduled**\n\nThe live session for **${room.group_name}** has been moved from **${oldTime}** to **${newTime}** today.${oldClassDoc.data().topic ? `\n\n**Topic:** ${oldClassDoc.data().topic}` : ''}`;
         try {
             const sentMessage = await ctx.telegram.sendMessage(groupId, announcementText, { parse_mode: 'Markdown' });
             await ctx.telegram.pinChatMessage(groupId, sentMessage.message_id, { disable_notification: true });
@@ -1378,14 +1379,14 @@ bot.command('rescheduleclass', async (ctx) => {
             await reportError('Could not announce or pin the rescheduled class message', error);
         }
 
-        ctx.reply(`✅ Rescheduled class from ${oldTime} to ${newTime}.`);
+        ctx.reply(`âœ… Rescheduled class from ${oldTime} to ${newTime}.`);
 
         const verifiedTrainees = await getVerifiedTraineeIds(groupId);
-        const reminderText = `🔄 The live session for **${room.group_name}** has been rescheduled to **${newTime}** today.${oldClassDoc.data().topic ? ` Topic: ${oldClassDoc.data().topic}` : ''}`;
+        const reminderText = `ðŸ”„ The live session for **${room.group_name}** has been rescheduled to **${newTime}** today.${oldClassDoc.data().topic ? ` Topic: ${oldClassDoc.data().topic}` : ''}`;
         await sendDmUsers(normalizeUserIds([room.specialist_id, ...verifiedTrainees]), reminderText, { parse_mode: 'Markdown' });
     } catch (error) {
         await reportError('rescheduleclass command failed', error);
-        ctx.reply('❌ Failed to reschedule the class. Please try again.');
+        ctx.reply('âŒ Failed to reschedule the class. Please try again.');
     }
 });
 
@@ -1424,10 +1425,10 @@ cron.schedule('* * * * *', async () => {
         let groupReminder;
         const topicText = classData.topic ? `\n\n**Topic:** ${classData.topic}` : '';
         if (reminderType === '0') {
-            reminderText = `🚨 **Class Starting Now** 🚨\n\nLive session for **${room.group_name}** is starting now at **${classData.time}**.${topicText} Please join immediately.`;
+            reminderText = `ðŸš¨ **Class Starting Now** ðŸš¨\n\nLive session for **${room.group_name}** is starting now at **${classData.time}**.${topicText} Please join immediately.`;
             groupReminder = reminderText;
         } else {
-            reminderText = `⏰ **Class Reminder** (${reminderType} minutes)\n\nLive session for **${room.group_name}** starts at **${classData.time}**.${topicText}\n\nPlease prepare and join on time.`;
+            reminderText = `â° **Class Reminder** (${reminderType} minutes)\n\nLive session for **${room.group_name}** starts at **${classData.time}**.${topicText}\n\nPlease prepare and join on time.`;
             groupReminder = reminderText;
         }
 
@@ -1443,7 +1444,7 @@ cron.schedule('* * * * *', async () => {
 
         // Send attendance prompt after class starts
         if (reminderType === '0') {
-            const attendancePrompt = `📊 **Attendance Check**\n\nDid you attend the live session for **${room.group_name}**?${topicText}\n\nReply with /attended or /missed in a private chat with me.`;
+            const attendancePrompt = `ðŸ“Š **Attendance Check**\n\nDid you attend the live session for **${room.group_name}**?${topicText}\n\nReply with /attended or /missed in a private chat with me.`;
             await sendDmUsers(await getVerifiedTraineeIds(classData.group_id), attendancePrompt, { parse_mode: 'Markdown' });
         }
     }
@@ -1473,7 +1474,7 @@ cron.schedule('* * * * *', async () => {
             const room = roomDoc.data();
 
             const verifiedTrainees = await getVerifiedTraineeIds(classData.group_id);
-            const feedbackText = `📝 **Session Feedback**\n\nHow was the live session for **${room.group_name}**?${classData.topic ? ` Topic: ${classData.topic}` : ''}\n\nRate 1-5 stars or share your thoughts in a reply to this message.`;
+            const feedbackText = `ðŸ“ **Session Feedback**\n\nHow was the live session for **${room.group_name}**?${classData.topic ? ` Topic: ${classData.topic}` : ''}\n\nRate 1-5 stars or share your thoughts in a reply to this message.`;
             await sendDmUsers(verifiedTrainees, feedbackText, { parse_mode: 'Markdown' });
 
             await db.collection('classes').doc(doc.id).update({ feedback_sent: true });
@@ -1502,7 +1503,7 @@ cron.schedule('30 7 * * *', async () => {
                 for (const classDoc of classesSnapshot.docs) {
                     const classData = classDoc.data();
                     const topic = classData.topic ? ` - ${classData.topic}` : '';
-                    summary += `\n• ${classData.group_name} at *${classData.time}*${topic}`;
+                    summary += `\nâ€¢ ${classData.group_name} at *${classData.time}*${topic}`;
                 }
             }
 
@@ -1522,7 +1523,7 @@ cron.schedule('0 10 * * 6', async () => {
         const specialistId = specialistDoc.id;
         const specialistName = specialistDoc.data().name;
 
-        const message = `📊 **Weekly Report Time!**\n\nGood morning ${specialistName}! It's Saturday, time to review your weekly performance.\n\nUse /weeklyreport in a private chat with me to generate and download your weekly summary, including class counts, attendance rates, and feedback.`;
+        const message = `ðŸ“Š **Weekly Report Time!**\n\nGood morning ${specialistName}! It's Saturday, time to review your weekly performance.\n\nUse /weeklyreport in a private chat with me to generate and download your weekly summary, including class counts, attendance rates, and feedback.`;
         
         try {
             await bot.telegram.sendMessage(specialistId, message, { parse_mode: 'Markdown' });
@@ -1553,8 +1554,8 @@ bot.on('new_chat_members', async (ctx) => {
             });
         }
 
-        await ctx.reply(`Welcome to Skillforge Digital! 🚀\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
-            Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', BOT_LINK)])
+        await ctx.reply(`Welcome to Skillforge Digital! ðŸš€\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
+            Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', BOT_LINK)])
         );
     } catch (error) {
         console.log("Could not send welcome message (Bot might have been kicked):", error.message);
@@ -1570,7 +1571,7 @@ bot.start(async (ctx) => {
         const doc = await userRef.get();
 
         if (!doc.exists) return ctx.reply("I couldn't find your record. Have you joined a Skillforge group yet?");
-        if (doc.data().verified) return ctx.reply("You are already verified! 🎓");
+        if (doc.data().verified) return ctx.reply("You are already verified! ðŸŽ“");
 
         await userRef.update({ verified: true, timed_out: false });
 
@@ -1582,7 +1583,7 @@ bot.start(async (ctx) => {
             console.log("Permission restore error:", error.message);
         }
 
-        ctx.reply("Verification successful! ✅ You now have full access.");
+        ctx.reply("Verification successful! âœ… You now have full access.");
     } else {
         // Check if registered specialist
         const specialistDoc = await db.collection('specialists').doc(userId).get();
@@ -1631,7 +1632,7 @@ bot.hears('Submit Weekly Report', async (ctx) => {
         let listResponse = 'You have multiple classroom groups. Please select one:\n';
         groupsSnapshot.docs.forEach(doc => {
             const room = doc.data();
-            listResponse += `• ${room.group_name}: ${doc.id}\n`;
+            listResponse += `â€¢ ${room.group_name}: ${doc.id}\n`;
         });
         return ctx.reply(listResponse + '\nUse /questionnaire <group_id> to proceed.');
     }
@@ -1672,7 +1673,7 @@ bot.hears('Schedule Class', async (ctx) => {
     const buttons = [];
     groupsSnapshot.docs.forEach(doc => {
         const room = doc.data();
-        response += `• ${room.group_name}: ${doc.id}\n`;
+        response += `â€¢ ${room.group_name}: ${doc.id}\n`;
         buttons.push([Markup.button.callback(`Schedule for ${room.group_name}`, `schedule_${doc.id}`)]);
     });
     response += '\nOr use /setclass <group_id> <time> [topic]';
@@ -1735,9 +1736,9 @@ cron.schedule('0 * * * *', async () => {
         });
 
         for (const [groupId, users] of Object.entries(groups)) {
-            const message = `⚠️ **Verification Reminder** ⚠️\n\n${users.length} members still need to verify. Please verify to avoid a chat timeout:\n${users.join(', ')}`;
+            const message = `âš ï¸ **Verification Reminder** âš ï¸\n\n${users.length} members still need to verify. Please verify to avoid a chat timeout:\n${users.join(', ')}`;
             try {
-                await bot.telegram.sendMessage(groupId, message, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', BOT_LINK)]) });
+                await bot.telegram.sendMessage(groupId, message, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', BOT_LINK)]) });
             } catch (error) {
                 await reportError('Hourly reminder error', error);
             }
@@ -1763,8 +1764,8 @@ cron.schedule('*/30 * * * *', async () => {
                 try {
                     await bot.telegram.restrictChatMember(data.group_id, data.telegram_id, { permissions: { can_send_messages: false } });
                     await db.collection('pending_verifications').doc(doc.id).update({ timed_out: true });
-                    const message = `⏳ @${data.username} has been timed out for failing to verify within 24 hours.`;
-                    await bot.telegram.sendMessage(data.group_id, message, Markup.inlineKeyboard([Markup.button.url('Verify to Restore Access 🔓', BOT_LINK)]));
+                    const message = `â³ @${data.username} has been timed out for failing to verify within 24 hours.`;
+                    await bot.telegram.sendMessage(data.group_id, message, Markup.inlineKeyboard([Markup.button.url('Verify to Restore Access ðŸ”“', BOT_LINK)]));
                 } catch (error) {
                     await reportError('Timeout enforcement error', error);
                 }
@@ -1785,7 +1786,7 @@ cron.schedule('*/30 * * * *', async () => {
                 try {
                     await bot.telegram.kickChatMember(data.group_id, data.telegram_id);
                     await db.collection('pending_verifications').doc(doc.id).update({ removed: true, removed_at: admin.firestore.FieldValue.serverTimestamp() });
-                    const message = `⛔ @${data.username} has been removed for failing to verify after timeout.`;
+                    const message = `â›” @${data.username} has been removed for failing to verify after timeout.`;
                     await bot.telegram.sendMessage(data.group_id, message);
                 } catch (error) {
                     await reportError('Timed-out removal error', error);
@@ -1851,33 +1852,58 @@ app.get('/review/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+const WEBHOOK_PATH = `/webhook/${process.env.BOT_TOKEN}`;
+const isWebhookMode = Boolean(SERVER_URL);
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
-bot.launch().then(async () => {
-    console.log('Skillforge Bot is fully operational!');
-    
-    // Set bot commands for the menu
-    await bot.telegram.setMyCommands([
-        { command: 'start', description: 'Start the bot and show menu' },
-        { command: 'register', description: 'Register as a Specialist (staff only)' },
-        { command: 'claim', description: 'Link a group as your classroom' },
-        { command: 'setclass', description: 'Schedule a live session' },
-        { command: 'cancelclass', description: 'Cancel scheduled sessions' },
-        { command: 'rescheduleclass', description: 'Change session time' },
-        { command: 'status', description: 'View daily status and schedule' },
-        { command: 'classlist', description: 'List upcoming sessions' },
-        { command: 'health', description: 'Check bot health' },
-        { command: 'attended', description: 'Mark attendance (trainees)' },
-        { command: 'missed', description: 'Report absence (trainees)' },
-        { command: 'calendar', description: 'View classes on a date' },
-        { command: 'report', description: 'Get attendance report' },
-        { command: 'weeklyreport', description: 'Generate weekly summary' },
-        { command: 'courseprogress', description: 'View course performance' },
-        { command: 'questionnaire', description: 'Start weekly review' },
-        { command: 'verify', description: 'Verify trainee account' },
-        { command: 'help', description: 'Show help menu' }
-    ]);
+bot.catch(async (err, ctx) => {
+    console.error('Bot update failed:', err?.message || err, 'Update type:', ctx?.updateType);
+    await reportError('Unhandled bot error', err);
 });
+
+const startBot = async () => {
+    try {
+        if (isWebhookMode) {
+            const webhookUrl = `${SERVER_URL}${WEBHOOK_PATH}`;
+            app.use(WEBHOOK_PATH, bot.webhookCallback(WEBHOOK_PATH));
+            await bot.telegram.setWebhook(webhookUrl);
+            console.log(`Bot webhook configured at ${webhookUrl}`);
+        } else {
+            await bot.telegram.deleteWebhook();
+            await bot.launch();
+            console.log('Skillforge Bot launched in polling mode');
+        }
+
+        await bot.telegram.setMyCommands([
+            { command: 'start', description: 'Start the bot and show menu' },
+            { command: 'register', description: 'Register as a Specialist (staff only)' },
+            { command: 'claim', description: 'Link a group as your classroom' },
+            { command: 'setclass', description: 'Schedule a live session' },
+            { command: 'cancelclass', description: 'Cancel scheduled sessions' },
+            { command: 'rescheduleclass', description: 'Change session time' },
+            { command: 'status', description: 'View daily status and schedule' },
+            { command: 'classlist', description: 'List upcoming sessions' },
+            { command: 'health', description: 'Check bot health' },
+            { command: 'attended', description: 'Mark attendance (trainees)' },
+            { command: 'missed', description: 'Report absence (trainees)' },
+            { command: 'calendar', description: 'View classes on a date' },
+            { command: 'report', description: 'Get attendance report' },
+            { command: 'weeklyreport', description: 'Generate weekly summary' },
+            { command: 'courseprogress', description: 'View course performance' },
+            { command: 'questionnaire', description: 'Start weekly review' },
+            { command: 'verify', description: 'Verify trainee account' },
+            { command: 'help', description: 'Show help menu' }
+        ]);
+
+        console.log('Skillforge Bot is fully operational!');
+    } catch (error) {
+        console.error('Failed to start Skillforge Bot:', error?.message || error);
+        await reportError('Bot startup failure', error);
+        process.exit(1);
+    }
+};
+
+startBot();
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
