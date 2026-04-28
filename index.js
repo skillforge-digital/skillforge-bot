@@ -13,21 +13,6 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// Route to serve the menu with dynamic bot username
-app.get('/menu', (req, res) => {
-    const menuPath = path.join(__dirname, 'public', 'menu.html');
-    fs.readFile(menuPath, 'utf8', (err, data) => {
-        if (err) {
-            console.error('Error reading menu.html:', err);
-            return res.status(500).send('Error loading menu');
-        }
-        // Replace hardcoded bot username with the one from environment
-        const updatedData = data.replace(/skillforge_bot/g, BOT_USERNAME_SAFE);
-        res.header('Content-Type', 'text/html; charset=utf-8');
-        res.send(updatedData);
-    });
-});
-
 // SAFELY CONNECT TO FIREBASE
 let serviceAccount;
 if (process.env.FIREBASE_JSON) {
@@ -50,13 +35,29 @@ if (missingEnvs.length) {
     process.exit(1);
 }
 
-const BOT_LINK = `https://t.me/${process.env.BOT_USERNAME}?start=verify`;
-const BOT_USERNAME_SAFE = process.env.BOT_USERNAME || 'skillforge_bot';
+const BOT_USERNAME_SAFE = (process.env.BOT_USERNAME || 'skillforge_bot').replace(/^@/, '').trim();
+const BOT_LINK = `https://t.me/${BOT_USERNAME_SAFE}?start=verify`;
 const REPORT_CHAT_ID = process.env.REPORT_CHAT_ID || null;
 const SERVER_URL = process.env.SERVER_URL || null;
 const REPORT_LOGO_PATH = process.env.REPORT_LOGO_PATH || './logo.jpg';
 const REPORT_LOGOTAG = process.env.REPORT_LOGOTAG || 'Skillforge Principal Bot';
 const CLASS_TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+const serveMenuHtml = (res) => {
+    const menuPath = path.join(__dirname, 'public', 'menu.html');
+    fs.readFile(menuPath, 'utf8', (err, data) => {
+        if (err) {
+            console.error('Error reading menu.html:', err);
+            return res.status(500).send('Error loading menu');
+        }
+        const updatedData = data.replace(/skillforge_bot/g, BOT_USERNAME_SAFE);
+        res.header('Content-Type', 'text/html; charset=utf-8');
+        res.send(updatedData);
+    });
+};
+
+app.get('/', (req, res) => serveMenuHtml(res));
+app.get('/menu', (req, res) => serveMenuHtml(res));
 
 // Utility function to generate bot mention
 const getBotMention = () => `@${BOT_USERNAME_SAFE}`;
@@ -1053,21 +1054,6 @@ bot.command('questionnaire', async (ctx) => {
     });
 });
 
-bot.action(/^schedule_(.+)$/, async (ctx) => {
-    const groupId = ctx.match[1];
-    const specialistId = ctx.from.id.toString();
-
-    const roomDoc = await db.collection('classrooms').doc(groupId).get();
-    if (!roomDoc.exists || roomDoc.data().specialist_id !== specialistId) {
-        return ctx.answerCbQuery('Invalid group.');
-    }
-
-    // Prompt for time
-    ctx.editMessageText(`Scheduling for ${roomDoc.data().group_name}. Please reply with the time in HH:MM format (e.g., 14:00) and optional topic.`);
-    // Note: This is simplistic; in a real app, use a state machine for multi-step input.
-    ctx.answerCbQuery();
-});
-
 bot.action('report_weekly', async (ctx) => {
     const specialistId = ctx.from.id.toString();
     // Trigger weekly report logic
@@ -1179,6 +1165,51 @@ bot.on('text', async (ctx) => {
         return;
     }
 
+    const scheduleSessionDoc = await db.collection('schedule_sessions').doc(userId).get();
+    if (scheduleSessionDoc.exists && scheduleSessionDoc.data().status === 'awaiting_time') {
+        const scheduleSession = scheduleSessionDoc.data();
+        const expiresAt = scheduleSession.expires_at?.toDate ? scheduleSession.expires_at.toDate() : null;
+        if (expiresAt && expiresAt.getTime() <= Date.now()) {
+            await db.collection('schedule_sessions').doc(userId).update({
+                status: 'expired',
+                expired_at: admin.firestore.FieldValue.serverTimestamp()
+            });
+            await ctx.reply('Your scheduling session has expired. Please tap Yes again to start scheduling.');
+            return;
+        }
+
+        const [timeInput, ...topicParts] = messageText.trim().split(/\s+/);
+        if (!CLASS_TIME_REGEX.test(timeInput)) {
+            await ctx.reply('âŒ Time format should be HH:MM in 24-hour format. Example: 14:00 Introduction to JavaScript');
+            return;
+        }
+
+        const topic = topicParts.join(' ') || null;
+        try {
+            await scheduleLiveClass({
+                groupId: scheduleSession.group_id,
+                specialistId: userId,
+                timeInput,
+                topic,
+                dateStr: scheduleSession.date || null,
+                telegram: ctx.telegram,
+                reply: (text, extra) => ctx.reply(text, extra)
+            });
+
+            await db.collection('schedule_sessions').doc(userId).set({
+                ...scheduleSession,
+                status: 'completed',
+                scheduled_time: timeInput,
+                topic,
+                completed_at: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        } catch (error) {
+            await reportError('Schedule session failed', error);
+            await ctx.reply('âŒ Failed to schedule the class. Please try again or tap Yes again to restart.');
+        }
+        return;
+    }
+
     // Check if this is a feedback response (simple heuristic: contains rating or is reply)
     if (messageText.match(/\b[1-5]\b/) || messageText.length > 10) {
         const todayStr = getLagosDateString();
@@ -1222,7 +1253,8 @@ bot.action('schedule_class', async (ctx) => {
     if (!specialistDoc.exists) {
         return ctx.answerCbQuery('You must be a registered specialist');
     }
-    ctx.reply('📅 Use /setclass <group_id> <HH:MM> [topic] to schedule a class', { parse_mode: 'Markdown' });
+    await sendScheduleGroupPicker(ctx, userId);
+    ctx.answerCbQuery();
 });
 
 bot.action('submit_report', (ctx) => {
@@ -1272,34 +1304,155 @@ bot.action(/^setup_program_(.+)$/, async (ctx) => {
     );
 });
 
-bot.action(/^schedule_(.+)$/, async (ctx) => {
-    const groupId = ctx.match[1];
-    ctx.reply(
-        `⏰ *Schedule Class*\n\n` +
-        `Please provide:\n` +
-        `• Time in HH:MM format (24-hour)\n` +
-        `• Optional topic\n\n` +
-        `Example: 14:30 Introduction to Node.js`,
+const beginScheduleSession = async (ctx, groupId, dateStr = null) => {
+    const specialistId = ctx.from.id.toString();
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    if (!roomDoc.exists) {
+        await ctx.reply('That group is not linked to a classroom yet.');
+        return false;
+    }
+
+    const room = roomDoc.data();
+    if (room.specialist_id !== specialistId) {
+        await ctx.reply('Only the linked Specialist can schedule this group.');
+        return false;
+    }
+
+    const effectiveDate = dateStr || getLagosDateString();
+    const expiresAt = admin.firestore.Timestamp.fromDate(new Date(Date.now() + (2 * 60 * 60 * 1000)));
+    await db.collection('schedule_sessions').doc(specialistId).set({
+        specialist_id: specialistId,
+        group_id: groupId,
+        group_name: room.group_name,
+        date: effectiveDate,
+        status: 'awaiting_time',
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        expires_at: expiresAt
+    }, { merge: true });
+
+    await ctx.reply(
+        `⏰ *Schedule Class for ${room.group_name}*\n\nSend the time in HH:MM format (24-hour) and an optional topic.\n\nExample:\n14:30 Introduction to Node.js`,
         { parse_mode: 'Markdown' }
     );
-});
+    return true;
+};
 
+bot.action(/^schedule_(.+)$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    try {
+        await beginScheduleSession(ctx, groupId);
+    } catch (error) {
+        await reportError('schedule callback failed', error);
+        await ctx.reply('âŒ Unable to start scheduling right now.');
+    }
+    ctx.answerCbQuery();
+});
 
 cron.schedule('0 8 * * *', async () => {
     const classroomsSnapshot = await db.collection('classrooms').get();
     if (classroomsSnapshot.empty) return;
+    const todayStr = getLagosDateString();
 
     classroomsSnapshot.forEach(async (doc) => {
         const room = doc.data();
-        const message = `Good morning Specialist ${room.specialist_name}! â˜€ï¸\n\nWill there be a live session for **${room.group_name}** today?\n\nIf yes, set the time using:\n\n\`/setclass ${room.group_id} 14:00\``;
+        const message = `Good morning Specialist ${room.specialist_name}! â˜€ï¸\n\nWill there be a live session for **${room.group_name}** today?`;
         
         try {
-            await bot.telegram.sendMessage(room.specialist_id, message, { parse_mode: 'Markdown' });
+            await bot.telegram.sendMessage(room.specialist_id, message, {
+                parse_mode: 'Markdown',
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback('Yes ✅', `daily_prompt_yes_${room.group_id}_${todayStr}`)],
+                    [Markup.button.callback('No ❌', `daily_prompt_no_${room.group_id}_${todayStr}`)]
+                ])
+            });
         } catch (error) {
             console.log(`Failed to message Specialist ${room.specialist_name}:`, error.message);
         }
     });
 }, { timezone: "Africa/Lagos" });
+
+bot.action(/^daily_prompt_yes_(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    const dateStr = ctx.match[2];
+    try {
+        const ok = await beginScheduleSession(ctx, groupId, dateStr);
+        if (ok) {
+            await ctx.reply('Send the time now and I will schedule it.');
+        }
+    } catch (error) {
+        await reportError('daily prompt yes failed', error);
+        await ctx.reply('âŒ Unable to start scheduling right now.');
+    }
+    ctx.answerCbQuery();
+});
+
+bot.action(/^daily_prompt_no_(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    try {
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        const roomName = roomDoc.exists ? roomDoc.data().group_name : 'your classroom';
+        await ctx.reply(`Okay. No class scheduled for ${roomName} today.`);
+    } catch (error) {
+        await reportError('daily prompt no failed', error);
+        await ctx.reply('Okay.');
+    }
+    ctx.answerCbQuery();
+});
+
+const scheduleLiveClass = async ({ groupId, specialistId, timeInput, topic, dateStr, telegram, reply }) => {
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    if (!roomDoc.exists) {
+        throw new Error('âŒ That group is not linked to a classroom. Have the Specialist claim the group first.');
+    }
+
+    const room = roomDoc.data();
+    if (specialistId !== room.specialist_id) {
+        throw new Error('âŒ Only the linked Specialist can schedule this group.');
+    }
+
+    if (!room.course_start_date) {
+        if (reply) {
+            await reply(`âš ï¸ I recommend setting the first course date for this group with:\n/setprogram ${groupId} YYYY-MM-DD\nThis allows the performance meter and weekly tracking to work correctly.`);
+        }
+    }
+
+    const todayStr = dateStr || getLagosDateString();
+    const classId = getClassDocId(groupId, todayStr, timeInput);
+    await db.collection('classes').doc(classId).set({
+        date: todayStr,
+        time: timeInput,
+        topic: topic,
+        reminder_30_sent: false,
+        reminder_15_sent: false,
+        reminder_5_sent: false,
+        reminder_0_sent: false,
+        feedback_sent: false,
+        group_id: groupId,
+        specialist_id: room.specialist_id,
+        group_name: room.group_name,
+        status: 'active',
+        created_at: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const topicText = topic ? `\n\n**Topic:** ${topic}` : '';
+    const announcementText = `ðŸ“¢ **Live Session Scheduled**\n\nA live session for **${room.group_name}** is confirmed at **${timeInput}** on ${todayStr}.${topicText}\n\nI will pin this announcement and send personal reminders to the Specialist and verified trainees at 30, 15, and 5 minutes before class.`;
+    try {
+        const sentMessage = await telegram.sendMessage(groupId, announcementText, { parse_mode: 'Markdown' });
+        await telegram.pinChatMessage(groupId, sentMessage.message_id, { disable_notification: true });
+    } catch (error) {
+        await reportError('Could not announce or pin the class message', error);
+    }
+
+    if (reply) {
+        await reply(`âœ… Locked in! Class for **${room.group_name}** is set for ${timeInput} on ${todayStr}. I have announced it and will send reminders. ðŸš€`, { parse_mode: 'Markdown' });
+    }
+
+    const verifiedTrainees = await getVerifiedTraineeIds(groupId);
+    const reminderText = `âœ… Live session for **${room.group_name}** is scheduled at **${timeInput}** on ${todayStr}.${topic ? ` Topic: ${topic}` : ''} I will remind you 30, 15, and 5 minutes before the class.`;
+    await sendDmUsers(normalizeUserIds([room.specialist_id, ...verifiedTrainees]), reminderText, { parse_mode: 'Markdown' });
+
+    return { room, todayStr, classId };
+};
 
 bot.command('setclass', async (ctx) => {
     try {
@@ -1315,57 +1468,24 @@ bot.command('setclass', async (ctx) => {
         if (!CLASS_TIME_REGEX.test(timeInput)) {
             return ctx.reply("âŒ Time format should be HH:MM in 24-hour format. Example: /setclass -100123456 14:00");
         }
-
-        const roomDoc = await db.collection('classrooms').doc(groupId).get();
-        if (!roomDoc.exists) {
-            return ctx.reply("âŒ That group is not linked to a classroom. Have the Specialist claim the group first.");
-        }
-
-        const room = roomDoc.data();
         const specialistId = ctx.from.id.toString();
-        if (specialistId !== room.specialist_id) {
-            return ctx.reply("âŒ Only the linked Specialist can schedule this group.");
-        }
-
-        if (!room.course_start_date) {
-            await ctx.reply(`âš ï¸ I recommend setting the first course date for this group with:\n/setprogram ${groupId} YYYY-MM-DD\nThis allows the performance meter and weekly tracking to work correctly.`);
-        }
-
-        const todayStr = getLagosDateString();
-        const classId = getClassDocId(groupId, todayStr, timeInput);
-        await db.collection('classes').doc(classId).set({
-            date: todayStr,
-            time: timeInput,
-            topic: topic,
-            reminder_30_sent: false,
-            reminder_15_sent: false,
-            reminder_5_sent: false,
-            reminder_0_sent: false,
-            feedback_sent: false,
-            group_id: groupId,
-            specialist_id: room.specialist_id,
-            group_name: room.group_name,
-            status: 'active',
-            created_at: admin.firestore.FieldValue.serverTimestamp()
+        await scheduleLiveClass({
+            groupId,
+            specialistId,
+            timeInput,
+            topic,
+            telegram: ctx.telegram,
+            reply: (text, extra) => ctx.reply(text, extra)
         });
-
-        const topicText = topic ? `\n\n**Topic:** ${topic}` : '';
-        const announcementText = `ðŸ“¢ **Live Session Scheduled**\n\nA live session for **${room.group_name}** is confirmed at **${timeInput}** today.${topicText}\n\nI will pin this announcement and send personal reminders to the Specialist and verified trainees at 30, 15, and 5 minutes before class.`;
-        try {
-            const sentMessage = await ctx.telegram.sendMessage(groupId, announcementText, { parse_mode: 'Markdown' });
-            await ctx.telegram.pinChatMessage(groupId, sentMessage.message_id, { disable_notification: true });
-        } catch (error) {
-            await reportError('Could not announce or pin the class message', error);
-        }
-
-        ctx.reply(`âœ… Locked in! Class for **${room.group_name}** is set for ${timeInput} today. I have announced it and will send reminders. ðŸš€`, { parse_mode: 'Markdown' });
-
-        const verifiedTrainees = await getVerifiedTraineeIds(groupId);
-        const reminderText = `âœ… Live session for **${room.group_name}** is scheduled at **${timeInput}** today.${topic ? ` Topic: ${topic}` : ''} I will remind you 30, 15, and 5 minutes before the class.`;
-        await sendDmUsers(normalizeUserIds([room.specialist_id, ...verifiedTrainees]), reminderText, { parse_mode: 'Markdown' });
     } catch (error) {
+        if (error?.message) {
+            const handled = error.message.startsWith('âŒ') || error.message.startsWith('❌');
+            if (handled) {
+                return ctx.reply(error.message);
+            }
+        }
         await reportError('setclass command failed', error);
-        ctx.reply('âŒ Failed to schedule the class. Please try again.');
+        return ctx.reply('âŒ Failed to schedule the class. Please try again.');
     }
 });
 
@@ -1678,29 +1798,118 @@ bot.on('new_chat_members', async (ctx) => {
     }
 });
 
+const handleVerification = async (ctx) => {
+    if (ctx.chat.type !== 'private') {
+        return ctx.reply('Please verify in a private chat with the bot.');
+    }
+
+    const userId = ctx.from.id.toString();
+    const userRef = db.collection('pending_verifications').doc(userId);
+    const doc = await userRef.get();
+
+    if (!doc.exists) return ctx.reply("I couldn't find your record. Have you joined a Skillforge group yet?");
+    if (doc.data().verified) return ctx.reply('You are already verified! 🎓');
+
+    await userRef.update({ verified: true, timed_out: false });
+
+    try {
+        await ctx.telegram.restrictChatMember(doc.data().group_id, userId, {
+            permissions: { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_other_messages: true, can_add_web_page_previews: true }
+        });
+    } catch (error) {
+        console.log('Permission restore error:', error.message);
+    }
+
+    return ctx.reply('Verification successful! ✅ You now have full access.');
+};
+
+const sendScheduleGroupPicker = async (ctx, specialistId) => {
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    const groupsSnapshot = await db.collection('classrooms')
+        .where('specialist_id', '==', specialistId)
+        .get();
+
+    if (groupsSnapshot.empty) {
+        return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+    }
+
+    let response = 'Select a group to schedule a class:\n';
+    const buttons = [];
+    groupsSnapshot.docs.forEach(doc => {
+        const room = doc.data();
+        response += `â€¢ ${room.group_name}: ${doc.id}\n`;
+        buttons.push([Markup.button.callback(`Schedule for ${room.group_name}`, `schedule_${doc.id}`)]);
+    });
+    response += '\nOr use /setclass <group_id> <time> [topic]';
+
+    return ctx.reply(response, Markup.inlineKeyboard(buttons));
+};
+
+bot.command('verify', async (ctx) => {
+    try {
+        await handleVerification(ctx);
+    } catch (error) {
+        await reportError('verify command failed', error);
+        ctx.reply('âŒ Unable to verify right now. Please try again later.');
+    }
+});
+
 bot.start(async (ctx) => {
     const payload = ctx.startPayload;
     const userId = ctx.from.id.toString();
 
     if (payload === 'verify') {
-        const userRef = db.collection('pending_verifications').doc(userId);
-        const doc = await userRef.get();
+        return await handleVerification(ctx);
+    }
 
-        if (!doc.exists) return ctx.reply("I couldn't find your record. Have you joined a Skillforge group yet?");
-        if (doc.data().verified) return ctx.reply("You are already verified! 🎓");
+    if (payload === 'register') {
+        return ctx.reply(`To register as a specialist, use:\n/register YOUR_PASSWORD\n\nIf you don't have the password, contact your head of units.`);
+    }
 
-        await userRef.update({ verified: true, timed_out: false });
+    if (payload === 'claim') {
+        return ctx.reply(`To claim a classroom, go to your Telegram group, add me as an admin, and type:\n/claim`);
+    }
 
-        try {
-            await ctx.telegram.restrictChatMember(doc.data().group_id, userId, {
-                permissions: { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_other_messages: true, can_add_web_page_previews: true }
-            });
-        } catch (error) { 
-            console.log("Permission restore error:", error.message);
-        }
+    if (payload === 'schedule') {
+        return await sendScheduleGroupPicker(ctx, userId);
+    }
 
-        ctx.reply("Verification successful! ✅ You now have full access.");
-    } else {
+    if (payload === 'classes') {
+        return ctx.reply('Use /classlist in a private chat to see your upcoming classes.');
+    }
+
+    if (payload === 'report') {
+        return ctx.reply('Choose a report type:', Markup.inlineKeyboard([
+            [Markup.button.callback('Weekly Report', 'report_weekly')],
+            [Markup.button.callback('Attendance Report', 'report_attendance')],
+            [Markup.button.callback('Course Progress', 'report_progress')]
+        ]));
+    }
+
+    if (payload === 'progress') {
+        return ctx.reply('Use /courseprogress <group_id> in a private chat to view course progress.');
+    }
+
+    if (payload === 'weekly') {
+        return ctx.reply('On Saturdays, use /weeklyreport to generate your weekly summary or /questionnaire to complete the weekly review.');
+    }
+
+    if (payload === 'help') {
+        return ctx.reply('Use /help to see the full commands list.');
+    }
+
+    if (payload === 'settings') {
+        return ctx.reply('Settings options:', Markup.inlineKeyboard([
+            [Markup.button.callback('Change Name', 'settings_name')],
+            [Markup.button.callback('View Profile', 'settings_profile')]
+        ]));
+    }
+
+    {
         // Check if registered specialist
         const specialistDoc = await db.collection('specialists').doc(userId).get();
         if (specialistDoc.exists) {
@@ -1938,10 +2147,6 @@ cron.schedule('*/30 * * * *', async () => {
 // ==========================================
 
 app.use(express.static('public'));
-
-app.get('/', (req, res) => res.sendFile(__dirname + '/public/menu.html'));
-
-app.get('/menu', (req, res) => res.sendFile(__dirname + '/public/menu.html'));
 
 app.get('/questionnaire', async (req, res) => {
     try {
