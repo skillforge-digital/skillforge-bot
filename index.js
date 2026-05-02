@@ -36,9 +36,11 @@ if (missingEnvs.length) {
 }
 
 const BOT_USERNAME_SAFE = (process.env.BOT_USERNAME || 'skillforge_bot').replace(/^@/, '').trim();
-const BOT_LINK = `https://t.me/${BOT_USERNAME_SAFE}?start=verify`;
+const BOT_LINK_BASE = `https://t.me/${BOT_USERNAME_SAFE}?start=`;
+const getVerifyLink = (groupId) => `${BOT_LINK_BASE}verify_${encodeURIComponent(String(groupId))}`;
 const REPORT_CHAT_ID = process.env.REPORT_CHAT_ID || null;
 const SERVER_URL = process.env.SERVER_URL || null;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 const REPORT_LOGO_PATH = process.env.REPORT_LOGO_PATH || './logo.jpg';
 const REPORT_LOGOTAG = process.env.REPORT_LOGOTAG || 'Skillforge Principal Bot';
 const CLASS_TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -67,6 +69,23 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const getClassDocId = (groupId, date, time) => `${groupId}_${date}_${time}`;
 const normalizeUserIds = (userIds) => [...new Set(userIds.filter(Boolean).map(String))];
+const getVerificationDocId = (groupId, userId) => `${groupId}_${userId}`;
+
+const getGroupVerification = async (groupId, userId) => {
+    const docId = getVerificationDocId(groupId, userId);
+    const doc = await db.collection('group_verifications').doc(docId).get();
+    return doc.exists ? { id: doc.id, ...doc.data() } : null;
+};
+
+const setGroupVerification = async (groupId, userId, payload) => {
+    const docId = getVerificationDocId(groupId, userId);
+    await db.collection('group_verifications').doc(docId).set(payload, { merge: true });
+};
+
+const isSpecialist = async (userId) => {
+    const doc = await db.collection('specialists').doc(String(userId)).get();
+    return doc.exists;
+};
 
 const reportError = async (message, error) => {
     const fullMessage = `â—ï¸ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`;
@@ -287,12 +306,13 @@ const buildReviewPdf = async (session) => {
 };
 
 async function getVerifiedTraineeIds(groupId) {
-    const snapshot = await db.collection('pending_verifications')
+    const snapshot = await db.collection('group_verifications')
         .where('group_id', '==', groupId)
         .where('verified', '==', true)
+        .where('removed', '==', false)
         .get();
 
-    return snapshot.docs.map(doc => doc.data().telegram_id.toString());
+    return snapshot.docs.map(doc => doc.data().user_id.toString());
 }
 
 async function sendDmUsers(userIds, text, extra = {}) {
@@ -353,6 +373,15 @@ bot.command('claim', async (ctx) => {
         const specialistData = specialistDoc.data();
         const specialistName = specialistData.name || 'Specialist';
 
+        const existingRoomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (existingRoomDoc.exists) {
+            const existing = existingRoomDoc.data();
+            if (existing?.specialist_id && existing.specialist_id !== specialistId) {
+                const ownerName = existing.specialist_name || 'another specialist';
+                return ctx.reply(`❌ This group is already linked to ${ownerName}.\n\nIf you need to transfer ownership, contact your head of units.`);
+            }
+        }
+
         // Capture group info
         const groupData = {
             group_id: groupId,
@@ -366,17 +395,21 @@ bot.command('claim', async (ctx) => {
         await db.collection('classrooms').doc(groupId).set(groupData);
 
         // Confirm via inline keyboard with next steps
+        const menuButtons = [
+            [Markup.button.callback('📅 Set Program Date', `setup_program_${groupId}`)],
+            [Markup.button.callback('⏰ Schedule Class', `schedule_${groupId}`)]
+        ];
+        if (SERVER_URL) {
+            menuButtons.push([Markup.button.url('📖 View Menu', `${SERVER_URL}/menu`)]);
+        }
+
         ctx.reply(
             `✅ *Classroom Successfully Linked!*\n\n` +
             `📍 *Group:* ${groupName}\n` +
             `👤 *Specialist:* ${specialistName}\n` +
             `📊 *Members:* ${ctx.chat.members_count || 'Unknown'}\n\n` +
             `*Next Step:* Set your course program details`,
-            Markup.inlineKeyboard([
-                [Markup.button.callback('📅 Set Program Date', `setup_program_${groupId}`)],
-                [Markup.button.callback('⏰ Schedule Class', `schedule_${groupId}`)],
-                [Markup.button.url('📖 View Menu', `${SERVER_URL}/menu`)]
-            ])
+            Markup.inlineKeyboard(menuButtons)
         );
 
     } catch (error) {
@@ -455,9 +488,10 @@ bot.command('status', async (ctx) => {
                 }
             }
 
-            const pendingSnapshot = await db.collection('pending_verifications')
+            const pendingSnapshot = await db.collection('group_verifications')
                 .where('verified', '==', false)
                 .where('timed_out', '==', false)
+                .where('removed', '==', false)
                 .get();
             response += `\n\nPending verifications in all groups: *${pendingSnapshot.size}*`;
             return ctx.reply(response, { parse_mode: 'Markdown' });
@@ -486,10 +520,11 @@ bot.command('status', async (ctx) => {
             }
         }
 
-        const pendingSnapshot = await db.collection('pending_verifications')
+        const pendingSnapshot = await db.collection('group_verifications')
             .where('group_id', '==', groupId)
             .where('verified', '==', false)
             .where('timed_out', '==', false)
+            .where('removed', '==', false)
             .get();
         response += `\n\nPending verifications: *${pendingSnapshot.size}*`;
         ctx.reply(response, { parse_mode: 'Markdown' });
@@ -559,9 +594,10 @@ bot.command('health', async (ctx) => {
             .where('status', '==', 'active')
             .get();
 
-        const pendingVerifications = await db.collection('pending_verifications')
+        const pendingVerifications = await db.collection('group_verifications')
             .where('verified', '==', false)
             .where('timed_out', '==', false)
+            .where('removed', '==', false)
             .get();
 
         const totalClasses = classesSnapshot.size;
@@ -585,7 +621,16 @@ bot.command('health', async (ctx) => {
 });
 
 // Attendance Commands
-bot.command('attended', async (ctx) => {
+const recordAttendance = async (classId, userId, attended) => {
+    await db.collection('attendance').doc(`${classId}_${userId}`).set({
+        class_id: classId,
+        user_id: userId,
+        attended,
+        timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+};
+
+const handleAttendanceCommand = async (ctx, attended) => {
     if (ctx.chat.type !== 'private') {
         return ctx.reply('Please use this command in a private chat with the bot.');
     }
@@ -593,75 +638,92 @@ bot.command('attended', async (ctx) => {
     const userId = ctx.from.id.toString();
     const todayStr = getLagosDateString();
 
-    // Find the most recent active class for this user
-    const userDoc = await db.collection('pending_verifications').doc(userId).get();
-    if (!userDoc.exists || !userDoc.data().verified) {
+    const verifiedGroupsSnapshot = await db.collection('group_verifications')
+        .where('user_id', '==', userId)
+        .where('verified', '==', true)
+        .where('removed', '==', false)
+        .get();
+
+    if (verifiedGroupsSnapshot.empty) {
         return ctx.reply('You are not verified. Please verify first.');
     }
 
-    const groupId = userDoc.data().group_id;
-    const classesSnapshot = await db.collection('classes')
-        .where('group_id', '==', groupId)
-        .where('date', '==', todayStr)
-        .where('status', '==', 'active')
-        .orderBy('time', 'desc')
-        .limit(1)
-        .get();
+    const candidateClasses = [];
+    for (const membershipDoc of verifiedGroupsSnapshot.docs) {
+        const membership = membershipDoc.data();
+        const groupId = membership.group_id;
+        const classesSnapshot = await db.collection('classes')
+            .where('group_id', '==', groupId)
+            .where('date', '==', todayStr)
+            .where('status', '==', 'active')
+            .orderBy('time', 'desc')
+            .limit(1)
+            .get();
 
-    if (classesSnapshot.empty) {
+        if (!classesSnapshot.empty) {
+            const classDoc = classesSnapshot.docs[0];
+            candidateClasses.push({ id: classDoc.id, data: classDoc.data() });
+        }
+    }
+
+    if (!candidateClasses.length) {
         return ctx.reply('No active classes found for today.');
     }
 
-    const classDoc = classesSnapshot.docs[0];
-    const classData = classDoc.data();
+    if (candidateClasses.length === 1) {
+        const classDoc = candidateClasses[0];
+        await recordAttendance(classDoc.id, userId, attended);
+        const classData = classDoc.data;
+        return ctx.reply(`${attended ? 'âœ… Attendance confirmed' : 'ðŸ“ Noted absence'} for **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`, { parse_mode: 'Markdown' });
+    }
 
-    await db.collection('attendance').doc(`${classDoc.id}_${userId}`).set({
-        class_id: classDoc.id,
-        user_id: userId,
-        attended: true,
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
+    const buttons = candidateClasses.slice(0, 8).map((classDoc) => {
+        const classData = classDoc.data;
+        return [Markup.button.callback(`${classData.group_name} â€¢ ${classData.time}`, `attendance_pick_${attended ? 'attended' : 'missed'}_${classDoc.id}`)];
     });
 
-    ctx.reply(`âœ… Attendance confirmed for **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`);
+    return ctx.reply('Select which class this applies to:', Markup.inlineKeyboard(buttons));
+};
+
+bot.command('attended', async (ctx) => {
+    try {
+        await handleAttendanceCommand(ctx, true);
+    } catch (error) {
+        await reportError('attended command failed', error);
+        ctx.reply('âŒ Unable to record attendance right now. Please try again later.');
+    }
 });
 
 bot.command('missed', async (ctx) => {
-    if (ctx.chat.type !== 'private') {
-        return ctx.reply('Please use this command in a private chat with the bot.');
+    try {
+        await handleAttendanceCommand(ctx, false);
+    } catch (error) {
+        await reportError('missed command failed', error);
+        ctx.reply('âŒ Unable to record absence right now. Please try again later.');
     }
+});
 
+bot.action(/^attendance_pick_(attended|missed)_(.+)$/, async (ctx) => {
+    const mode = ctx.match[1];
+    const classId = ctx.match[2];
+    const attended = mode === 'attended';
     const userId = ctx.from.id.toString();
-    const todayStr = getLagosDateString();
+    try {
+        const classDoc = await db.collection('classes').doc(classId).get();
+        if (!classDoc.exists) {
+            await ctx.reply('That class could not be found.');
+            ctx.answerCbQuery();
+            return;
+        }
 
-    const userDoc = await db.collection('pending_verifications').doc(userId).get();
-    if (!userDoc.exists || !userDoc.data().verified) {
-        return ctx.reply('You are not verified. Please verify first.');
+        await recordAttendance(classId, userId, attended);
+        const classData = classDoc.data();
+        await ctx.reply(`${attended ? 'âœ… Attendance confirmed' : 'ðŸ“ Noted absence'} for **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await reportError('attendance pick failed', error);
+        await ctx.reply('âŒ Unable to save attendance right now. Please try again later.');
     }
-
-    const groupId = userDoc.data().group_id;
-    const classesSnapshot = await db.collection('classes')
-        .where('group_id', '==', groupId)
-        .where('date', '==', todayStr)
-        .where('status', '==', 'active')
-        .orderBy('time', 'desc')
-        .limit(1)
-        .get();
-
-    if (classesSnapshot.empty) {
-        return ctx.reply('No active classes found for today.');
-    }
-
-    const classDoc = classesSnapshot.docs[0];
-    const classData = classDoc.data();
-
-    await db.collection('attendance').doc(`${classDoc.id}_${userId}`).set({
-        class_id: classDoc.id,
-        user_id: userId,
-        attended: false,
-        timestamp: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    ctx.reply(`ðŸ“ Noted that you missed **${classData.group_name}** at **${classData.time}**.${classData.topic ? ` Topic: ${classData.topic}` : ''}`);
+    ctx.answerCbQuery();
 });
 
 // Assign Backup Specialist
@@ -1213,22 +1275,37 @@ bot.on('text', async (ctx) => {
     // Check if this is a feedback response (simple heuristic: contains rating or is reply)
     if (messageText.match(/\b[1-5]\b/) || messageText.length > 10) {
         const todayStr = getLagosDateString();
-        const userDoc = await db.collection('pending_verifications').doc(userId).get();
-        if (!userDoc.exists || !userDoc.data().verified) return;
-
-        const groupId = userDoc.data().group_id;
-        const recentClasses = await db.collection('classes')
-            .where('group_id', '==', groupId)
-            .where('date', '==', todayStr)
-            .where('feedback_sent', '==', true)
-            .orderBy('time', 'desc')
-            .limit(1)
+        const verifiedGroupsSnapshot = await db.collection('group_verifications')
+            .where('user_id', '==', userId)
+            .where('verified', '==', true)
+            .where('removed', '==', false)
             .get();
+        if (verifiedGroupsSnapshot.empty) return;
 
-        if (!recentClasses.empty) {
-            const classDoc = recentClasses.docs[0];
+        let bestClass = null;
+        for (const membershipDoc of verifiedGroupsSnapshot.docs) {
+            const membership = membershipDoc.data();
+            const groupId = membership.group_id;
+            const recentClasses = await db.collection('classes')
+                .where('group_id', '==', groupId)
+                .where('date', '==', todayStr)
+                .where('feedback_sent', '==', true)
+                .orderBy('time', 'desc')
+                .limit(1)
+                .get();
+
+            if (!recentClasses.empty) {
+                const classDoc = recentClasses.docs[0];
+                const classData = classDoc.data();
+                if (!bestClass || String(classData.time) > String(bestClass.data.time)) {
+                    bestClass = { id: classDoc.id, data: classData };
+                }
+            }
+        }
+
+        if (bestClass) {
             await db.collection('feedback').add({
-                class_id: classDoc.id,
+                class_id: bestClass.id,
                 user_id: userId,
                 feedback: messageText,
                 timestamp: admin.firestore.FieldValue.serverTimestamp()
@@ -1349,26 +1426,29 @@ bot.action(/^schedule_(.+)$/, async (ctx) => {
 });
 
 cron.schedule('0 8 * * *', async () => {
-    const classroomsSnapshot = await db.collection('classrooms').get();
-    if (classroomsSnapshot.empty) return;
-    const todayStr = getLagosDateString();
+    try {
+        const classroomsSnapshot = await db.collection('classrooms').get();
+        if (classroomsSnapshot.empty) return;
+        const todayStr = getLagosDateString();
 
-    classroomsSnapshot.forEach(async (doc) => {
-        const room = doc.data();
-        const message = `Good morning Specialist ${room.specialist_name}! â˜€ï¸\n\nWill there be a live session for **${room.group_name}** today?`;
-        
-        try {
-            await bot.telegram.sendMessage(room.specialist_id, message, {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('Yes ✅', `daily_prompt_yes_${room.group_id}_${todayStr}`)],
-                    [Markup.button.callback('No ❌', `daily_prompt_no_${room.group_id}_${todayStr}`)]
-                ])
-            });
-        } catch (error) {
-            console.log(`Failed to message Specialist ${room.specialist_name}:`, error.message);
+        for (const doc of classroomsSnapshot.docs) {
+            const room = doc.data();
+            const message = `Good morning Specialist ${room.specialist_name}! â˜€ï¸\n\nWill there be a live session for **${room.group_name}** today?`;
+            try {
+                await bot.telegram.sendMessage(room.specialist_id, message, {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback('Yes ✅', `daily_prompt_yes_${room.group_id}_${todayStr}`)],
+                        [Markup.button.callback('No ❌', `daily_prompt_no_${room.group_id}_${todayStr}`)]
+                    ])
+                });
+            } catch (error) {
+                await reportError(`Failed to message specialist for ${room.group_name}`, error);
+            }
         }
-    });
+    } catch (error) {
+        await reportError('Daily 8am prompt job failed', error);
+    }
 }, { timezone: "Africa/Lagos" });
 
 bot.action(/^daily_prompt_yes_(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})$/, async (ctx) => {
@@ -1780,47 +1860,116 @@ bot.on('new_chat_members', async (ctx) => {
 
         for (const member of newMembers) {
             if (member.is_bot) continue;
-            await db.collection('pending_verifications').doc(member.id.toString()).set({
-                telegram_id: member.id,
-                username: member.username || member.first_name,
+            await setGroupVerification(groupId, member.id.toString(), {
                 group_id: groupId,
+                user_id: member.id.toString(),
+                username: member.username || member.first_name || null,
                 joined_at: admin.firestore.FieldValue.serverTimestamp(),
                 verified: false,
-                timed_out: false
+                verified_at: null,
+                timed_out: false,
+                timed_out_at: null,
+                removed: false,
+                removed_at: null
             });
         }
 
         await ctx.reply(`Welcome to Skillforge Digital! ðŸš€\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
-            Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', BOT_LINK)])
+            Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))])
         );
     } catch (error) {
         console.log("Could not send welcome message (Bot might have been kicked):", error.message);
     }
 });
 
-const handleVerification = async (ctx) => {
+const handleVerification = async (ctx, groupIdHint = null) => {
     if (ctx.chat.type !== 'private') {
         return ctx.reply('Please verify in a private chat with the bot.');
     }
 
     const userId = ctx.from.id.toString();
-    const userRef = db.collection('pending_verifications').doc(userId);
-    const doc = await userRef.get();
+    const candidatesSnapshot = await db.collection('group_verifications')
+        .where('user_id', '==', userId)
+        .where('verified', '==', false)
+        .where('removed', '==', false)
+        .get();
 
-    if (!doc.exists) return ctx.reply("I couldn't find your record. Have you joined a Skillforge group yet?");
-    if (doc.data().verified) return ctx.reply('You are already verified! 🎓');
+    let candidates = candidatesSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
 
-    await userRef.update({ verified: true, timed_out: false });
-
-    try {
-        await ctx.telegram.restrictChatMember(doc.data().group_id, userId, {
-            permissions: { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_other_messages: true, can_add_web_page_previews: true }
-        });
-    } catch (error) {
-        console.log('Permission restore error:', error.message);
+    if (!candidates.length) {
+        const legacyDoc = await db.collection('pending_verifications').doc(userId).get();
+        if (legacyDoc.exists && !legacyDoc.data().verified) {
+            const legacy = legacyDoc.data();
+            await setGroupVerification(legacy.group_id, userId, {
+                group_id: String(legacy.group_id),
+                user_id: userId,
+                username: legacy.username || null,
+                joined_at: legacy.joined_at || admin.firestore.FieldValue.serverTimestamp(),
+                verified: false,
+                verified_at: null,
+                timed_out: Boolean(legacy.timed_out),
+                timed_out_at: null,
+                removed: Boolean(legacy.removed),
+                removed_at: legacy.removed_at || null
+            });
+            const refreshedSnapshot = await db.collection('group_verifications')
+                .where('user_id', '==', userId)
+                .where('verified', '==', false)
+                .where('removed', '==', false)
+                .get();
+            candidates = refreshedSnapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+        }
     }
 
-    return ctx.reply('Verification successful! ✅ You now have full access.');
+    if (!candidates.length) {
+        return ctx.reply("I couldn't find any pending verifications for you. If you just joined a group, wait a moment and try again.");
+    }
+
+    const finalizeVerification = async (groupId) => {
+        const existing = await getGroupVerification(groupId, userId);
+        if (!existing) {
+            return ctx.reply("I couldn't find your verification record for that group.");
+        }
+
+        if (existing.verified) {
+            return ctx.reply('You are already verified! 🎓');
+        }
+
+        await setGroupVerification(groupId, userId, {
+            verified: true,
+            verified_at: admin.firestore.FieldValue.serverTimestamp(),
+            timed_out: false,
+            timed_out_at: null
+        });
+
+        try {
+            await ctx.telegram.restrictChatMember(groupId, userId, {
+                permissions: { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_other_messages: true, can_add_web_page_previews: true }
+            });
+        } catch (error) {
+            console.log('Permission restore error:', error.message);
+        }
+
+        return ctx.reply('Verification successful! ✅ You now have full access.');
+    };
+
+    if (groupIdHint) {
+        return await finalizeVerification(String(groupIdHint));
+    }
+
+    if (candidates.length === 1) {
+        return await finalizeVerification(String(candidates[0].group_id));
+    }
+
+    const buttons = [];
+    for (const candidate of candidates.slice(0, 8)) {
+        const groupId = String(candidate.group_id);
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        const label = roomDoc.exists ? (roomDoc.data().group_name || groupId) : groupId;
+        buttons.push([Markup.button.callback(`Verify: ${label}`, `verify_select_${groupId}`)]);
+    }
+
+    return ctx.reply('You have multiple pending verifications. Select the group to verify:', Markup.inlineKeyboard(buttons));
 };
 
 const sendScheduleGroupPicker = async (ctx, specialistId) => {
@@ -1858,12 +2007,24 @@ bot.command('verify', async (ctx) => {
     }
 });
 
+bot.action(/^verify_select_(.+)$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    try {
+        await handleVerification(ctx, groupId);
+    } catch (error) {
+        await reportError('verify selection failed', error);
+        await ctx.reply('âŒ Unable to verify right now. Please try again later.');
+    }
+    ctx.answerCbQuery();
+});
+
 bot.start(async (ctx) => {
     const payload = ctx.startPayload;
     const userId = ctx.from.id.toString();
 
-    if (payload === 'verify') {
-        return await handleVerification(ctx);
+    if (payload === 'verify' || (payload && payload.startsWith('verify_'))) {
+        const groupId = payload && payload.startsWith('verify_') ? decodeURIComponent(payload.slice('verify_'.length)) : null;
+        return await handleVerification(ctx, groupId);
     }
 
     if (payload === 'register') {
@@ -1907,6 +2068,10 @@ bot.start(async (ctx) => {
             [Markup.button.callback('Change Name', 'settings_name')],
             [Markup.button.callback('View Profile', 'settings_profile')]
         ]));
+    }
+
+    if (payload) {
+        return ctx.reply('Unknown action. Use /help to see available commands.');
     }
 
     {
@@ -2069,20 +2234,27 @@ bot.hears('Help', async (ctx) => {
 
 cron.schedule('0 * * * *', async () => {
     try {
-        const snapshot = await db.collection('pending_verifications').where('verified', '==', false).where('timed_out', '==', false).get();
+        const snapshot = await db.collection('group_verifications')
+            .where('verified', '==', false)
+            .where('timed_out', '==', false)
+            .where('removed', '==', false)
+            .get();
         if (snapshot.empty) return;
 
         const groups = {};
         snapshot.forEach(doc => {
             const data = doc.data();
             if (!groups[data.group_id]) groups[data.group_id] = [];
-            groups[data.group_id].push(`@${data.username}`);
+            groups[data.group_id].push(data.username ? `@${data.username}` : `${data.user_id}`);
         });
 
         for (const [groupId, users] of Object.entries(groups)) {
             const message = `âš ï¸ **Verification Reminder** âš ï¸\n\n${users.length} members still need to verify. Please verify to avoid a chat timeout:\n${users.join(', ')}`;
             try {
-                await bot.telegram.sendMessage(groupId, message, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', BOT_LINK)]) });
+                await bot.telegram.sendMessage(groupId, message, {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))])
+                });
             } catch (error) {
                 await reportError('Hourly reminder error', error);
             }
@@ -2097,19 +2269,24 @@ cron.schedule('*/30 * * * *', async () => {
         const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const timeoutThreshold = admin.firestore.Timestamp.fromDate(yesterday);
 
-        const snapshot = await db.collection('pending_verifications')
+        const snapshot = await db.collection('group_verifications')
             .where('verified', '==', false)
             .where('timed_out', '==', false)
+            .where('removed', '==', false)
             .where('joined_at', '<=', timeoutThreshold)
             .get();
         if (!snapshot.empty) {
             for (const doc of snapshot.docs) {
                 const data = doc.data();
                 try {
-                    await bot.telegram.restrictChatMember(data.group_id, data.telegram_id, { permissions: { can_send_messages: false } });
-                    await db.collection('pending_verifications').doc(doc.id).update({ timed_out: true });
-                    const message = `â³ @${data.username} has been timed out for failing to verify within 24 hours.`;
-                    await bot.telegram.sendMessage(data.group_id, message, Markup.inlineKeyboard([Markup.button.url('Verify to Restore Access ðŸ”“', BOT_LINK)]));
+                    await bot.telegram.restrictChatMember(data.group_id, data.user_id, { permissions: { can_send_messages: false } });
+                    await db.collection('group_verifications').doc(doc.id).update({
+                        timed_out: true,
+                        timed_out_at: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    const displayName = data.username ? `@${data.username}` : `${data.user_id}`;
+                    const message = `â³ ${displayName} has been timed out for failing to verify within 24 hours.`;
+                    await bot.telegram.sendMessage(data.group_id, message, Markup.inlineKeyboard([Markup.button.url('Verify to Restore Access ðŸ”“', getVerifyLink(data.group_id))]));
                 } catch (error) {
                     await reportError('Timeout enforcement error', error);
                 }
@@ -2118,9 +2295,10 @@ cron.schedule('*/30 * * * *', async () => {
 
         const removalCutoff = new Date(Date.now() - 25 * 60 * 60 * 1000);
         const removalThreshold = admin.firestore.Timestamp.fromDate(removalCutoff);
-        const removalSnapshot = await db.collection('pending_verifications')
+        const removalSnapshot = await db.collection('group_verifications')
             .where('verified', '==', false)
             .where('timed_out', '==', true)
+            .where('removed', '==', false)
             .where('joined_at', '<=', removalThreshold)
             .get();
 
@@ -2128,9 +2306,10 @@ cron.schedule('*/30 * * * *', async () => {
             for (const doc of removalSnapshot.docs) {
                 const data = doc.data();
                 try {
-                    await bot.telegram.kickChatMember(data.group_id, data.telegram_id);
-                    await db.collection('pending_verifications').doc(doc.id).update({ removed: true, removed_at: admin.firestore.FieldValue.serverTimestamp() });
-                    const message = `â›” @${data.username} has been removed for failing to verify after timeout.`;
+                    await bot.telegram.kickChatMember(data.group_id, data.user_id);
+                    await db.collection('group_verifications').doc(doc.id).update({ removed: true, removed_at: admin.firestore.FieldValue.serverTimestamp() });
+                    const displayName = data.username ? `@${data.username}` : `${data.user_id}`;
+                    const message = `â›” ${displayName} has been removed for failing to verify after timeout.`;
                     await bot.telegram.sendMessage(data.group_id, message);
                 } catch (error) {
                     await reportError('Timed-out removal error', error);
@@ -2146,7 +2325,8 @@ cron.schedule('*/30 * * * *', async () => {
 // MODULE 3: SERVER START
 // ==========================================
 
-app.use(express.static('public'));
+app.get('/public/menu.html', (req, res) => res.redirect('/menu'));
+app.use('/public', express.static('public'));
 
 app.get('/questionnaire', async (req, res) => {
     try {
@@ -2196,8 +2376,8 @@ app.get('/review/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_PATH = `/webhook/${process.env.BOT_TOKEN}`;
 const isWebhookMode = Boolean(SERVER_URL);
+const WEBHOOK_PATH = isWebhookMode ? `/webhook/${WEBHOOK_SECRET}` : null;
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
@@ -2209,6 +2389,10 @@ bot.catch(async (err, ctx) => {
 const startBot = async () => {
     try {
         if (isWebhookMode) {
+            if (!WEBHOOK_SECRET) {
+                console.error('Missing required environment variable: WEBHOOK_SECRET');
+                process.exit(1);
+            }
             const webhookUrl = `${SERVER_URL}${WEBHOOK_PATH}`;
             app.use(WEBHOOK_PATH, bot.webhookCallback(WEBHOOK_PATH));
             await bot.telegram.setWebhook(webhookUrl);
