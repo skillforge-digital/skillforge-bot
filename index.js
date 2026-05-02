@@ -87,6 +87,30 @@ const isSpecialist = async (userId) => {
     return doc.exists;
 };
 
+const startVerifyCampaign = async (groupId) => {
+    const docRef = db.collection('group_settings').doc(String(groupId));
+    const now = admin.firestore.Timestamp.fromDate(new Date());
+    await docRef.set({
+        group_id: String(groupId),
+        verify_campaign_active: true,
+        verify_campaign_started_at: now,
+        last_verify_reminder_at: now
+    }, { merge: true });
+};
+
+const updateVerifyReminderSent = async (groupId) => {
+    await db.collection('group_settings').doc(String(groupId)).set({
+        last_verify_reminder_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+};
+
+const stopVerifyCampaign = async (groupId) => {
+    await db.collection('group_settings').doc(String(groupId)).set({
+        verify_campaign_active: false,
+        verify_campaign_stopped_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+};
+
 const reportError = async (message, error) => {
     const fullMessage = `â—ï¸ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`;
     console.error(fullMessage);
@@ -1882,6 +1906,27 @@ bot.on('new_chat_members', async (ctx) => {
     }
 });
 
+bot.on('my_chat_member', async (ctx) => {
+    try {
+        const chat = ctx.chat;
+        if (!chat || !['group', 'supergroup'].includes(chat.type)) return;
+        const update = ctx.update?.my_chat_member;
+        const newStatus = update?.new_chat_member?.status;
+        const oldStatus = update?.old_chat_member?.status;
+        if (!['member', 'administrator'].includes(newStatus)) return;
+        if (!['left', 'kicked'].includes(oldStatus)) return;
+
+        const groupId = chat.id.toString();
+        await startVerifyCampaign(groupId);
+        const message = `✅ Verification Required\n\nPlease verify your account to access the classroom fully.\n\nTap the button below to verify:`;
+        await ctx.telegram.sendMessage(groupId, message, Markup.inlineKeyboard([
+            [Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))]
+        ]));
+    } catch (error) {
+        await reportError('my_chat_member handler failed', error);
+    }
+});
+
 const handleVerification = async (ctx, groupIdHint = null) => {
     if (ctx.chat.type !== 'private') {
         return ctx.reply('Please verify in a private chat with the bot.');
@@ -1927,12 +1972,23 @@ const handleVerification = async (ctx, groupIdHint = null) => {
 
     const finalizeVerification = async (groupId) => {
         const existing = await getGroupVerification(groupId, userId);
-        if (!existing) {
-            return ctx.reply("I couldn't find your verification record for that group.");
+        if (existing?.verified) {
+            return ctx.reply('You are already verified! 🎓');
         }
 
-        if (existing.verified) {
-            return ctx.reply('You are already verified! 🎓');
+        if (!existing) {
+            await setGroupVerification(groupId, userId, {
+                group_id: String(groupId),
+                user_id: userId,
+                username: ctx.from?.username || ctx.from?.first_name || null,
+                joined_at: admin.firestore.FieldValue.serverTimestamp(),
+                verified: false,
+                verified_at: null,
+                timed_out: false,
+                timed_out_at: null,
+                removed: false,
+                removed_at: null
+            });
         }
 
         await setGroupVerification(groupId, userId, {
@@ -2232,35 +2288,49 @@ bot.hears('Help', async (ctx) => {
 - Use /claim in a group to link it`);
 });
 
-cron.schedule('0 * * * *', async () => {
+cron.schedule('0 */3 * * *', async () => {
     try {
-        const snapshot = await db.collection('group_verifications')
-            .where('verified', '==', false)
-            .where('timed_out', '==', false)
-            .where('removed', '==', false)
+        const settingsSnapshot = await db.collection('group_settings')
+            .where('verify_campaign_active', '==', true)
             .get();
-        if (snapshot.empty) return;
+        if (settingsSnapshot.empty) return;
 
-        const groups = {};
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            if (!groups[data.group_id]) groups[data.group_id] = [];
-            groups[data.group_id].push(data.username ? `@${data.username}` : `${data.user_id}`);
-        });
+        const now = Date.now();
+        for (const settingsDoc of settingsSnapshot.docs) {
+            const settings = settingsDoc.data();
+            const groupId = String(settings.group_id || settingsDoc.id);
+            const startedAt = settings.verify_campaign_started_at?.toDate ? settings.verify_campaign_started_at.toDate().getTime() : null;
+            const lastSentAt = settings.last_verify_reminder_at?.toDate ? settings.last_verify_reminder_at.toDate().getTime() : null;
 
-        for (const [groupId, users] of Object.entries(groups)) {
-            const message = `âš ï¸ **Verification Reminder** âš ï¸\n\n${users.length} members still need to verify. Please verify to avoid a chat timeout:\n${users.join(', ')}`;
+            if (startedAt && (now - startedAt) > (24 * 60 * 60 * 1000)) {
+                const unverifiedSnapshot = await db.collection('group_verifications')
+                    .where('group_id', '==', groupId)
+                    .where('verified', '==', false)
+                    .where('removed', '==', false)
+                    .get();
+                if (unverifiedSnapshot.empty) {
+                    await stopVerifyCampaign(groupId);
+                    continue;
+                }
+            }
+
+            if (lastSentAt && (now - lastSentAt) < (3 * 60 * 60 * 1000) - (60 * 1000)) {
+                continue;
+            }
+
+            const message = `âš ï¸ **Verification Reminder** âš ï¸\n\nIf you have not verified yet, please verify now to access the classroom fully.`;
             try {
                 await bot.telegram.sendMessage(groupId, message, {
                     parse_mode: 'Markdown',
                     ...Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))])
                 });
+                await updateVerifyReminderSent(groupId);
             } catch (error) {
-                await reportError('Hourly reminder error', error);
+                await reportError('3-hour verification reminder failed', error);
             }
         }
     } catch (error) {
-        await reportError('Hourly verification reminder job failed', error);
+        await reportError('3-hour verification reminder job failed', error);
     }
 });
 
