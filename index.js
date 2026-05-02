@@ -41,6 +41,7 @@ const getVerifyLink = (groupId) => `${BOT_LINK_BASE}verify_${encodeURIComponent(
 const REPORT_CHAT_ID = process.env.REPORT_CHAT_ID || null;
 const SERVER_URL = process.env.SERVER_URL || null;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
+const SUPER_ADMIN_KEY = process.env.SUPER_ADMIN_KEY || null;
 const REPORT_LOGO_PATH = process.env.REPORT_LOGO_PATH || './logo.jpg';
 const REPORT_LOGOTAG = process.env.REPORT_LOGOTAG || 'Skillforge Principal Bot';
 const CLASS_TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -110,6 +111,23 @@ const stopVerifyCampaign = async (groupId) => {
         verify_campaign_stopped_at: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
 };
+
+const parseCookies = (cookieHeader) => {
+    const out = {};
+    if (!cookieHeader) return out;
+    cookieHeader.split(';').forEach(part => {
+        const idx = part.indexOf('=');
+        if (idx === -1) return;
+        const k = part.slice(0, idx).trim();
+        const v = part.slice(idx + 1).trim();
+        out[k] = decodeURIComponent(v);
+    });
+    return out;
+};
+
+const randomCode = () => String(Math.floor(100000 + Math.random() * 900000));
+const hashCode = (code) => require('crypto').createHash('sha256').update(String(code)).digest('hex');
+const randomSessionId = () => require('crypto').randomBytes(24).toString('hex');
 
 const reportError = async (message, error) => {
     const fullMessage = `â—ï¸ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`;
@@ -2397,6 +2415,296 @@ cron.schedule('*/30 * * * *', async () => {
 
 app.get('/public/menu.html', (req, res) => res.redirect('/menu'));
 app.use('/public', express.static('public'));
+
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
+
+const getAdminSession = async (req) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const sid = cookies.sf_admin_session;
+    if (!sid) return null;
+    const doc = await db.collection('admin_sessions').doc(String(sid)).get();
+    if (!doc.exists) return null;
+    const sess = doc.data();
+    const exp = sess.expires_at?.toDate ? sess.expires_at.toDate().getTime() : 0;
+    if (Date.now() > exp) return null;
+    return sess;
+};
+
+const setAdminSessionCookie = (res, sessionId) => {
+    const base = `sf_admin_session=${encodeURIComponent(String(sessionId))}; Path=/; HttpOnly; SameSite=Lax`;
+    res.setHeader('Set-Cookie', base);
+};
+
+const clearAdminSessionCookie = (res) => {
+    res.setHeader('Set-Cookie', 'sf_admin_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
+};
+
+app.get('/admin/api/me', async (req, res) => {
+    try {
+        const sess = await getAdminSession(req);
+        if (!sess) return res.status(401).json({ error: 'unauthorized' });
+        return res.json({ telegram_id: sess.telegram_id, role: sess.role });
+    } catch (error) {
+        await reportError('admin me failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.post('/admin/auth/request', async (req, res) => {
+    try {
+        const telegram_id = String(req.body?.telegram_id || '').trim();
+        if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
+        const specialistDoc = await db.collection('specialists').doc(telegram_id).get();
+        if (!specialistDoc.exists) return res.status(403).json({ error: 'not a specialist' });
+
+        const code = randomCode();
+        const expiresAt = admin.firestore.Timestamp.fromDate(new Date(Date.now() + 10 * 60 * 1000));
+        await db.collection('admin_sessions_pending').doc(telegram_id).set({
+            telegram_id,
+            code_hash: hashCode(code),
+            attempts: 0,
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            expires_at: expiresAt
+        }, { merge: true });
+
+        await bot.telegram.sendMessage(telegram_id, `Skillforge Admin login code: ${code}\n\nThis code expires in 10 minutes.`);
+        return res.json({ ok: true });
+    } catch (error) {
+        await reportError('admin auth request failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.post('/admin/auth/verify', async (req, res) => {
+    try {
+        const telegram_id = String(req.body?.telegram_id || '').trim();
+        const code = String(req.body?.code || '').trim();
+        if (!telegram_id || !code) return res.status(400).json({ error: 'telegram_id and code required' });
+
+        const pendingDoc = await db.collection('admin_sessions_pending').doc(telegram_id).get();
+        if (!pendingDoc.exists) return res.status(403).json({ error: 'no pending code' });
+        const pending = pendingDoc.data();
+        const expiresAt = pending.expires_at?.toDate ? pending.expires_at.toDate().getTime() : 0;
+        if (Date.now() > expiresAt) return res.status(403).json({ error: 'code expired' });
+
+        const attempts = Number(pending.attempts || 0);
+        if (attempts >= 5) return res.status(429).json({ error: 'too many attempts' });
+
+        if (hashCode(code) !== pending.code_hash) {
+            await db.collection('admin_sessions_pending').doc(telegram_id).set({ attempts: attempts + 1 }, { merge: true });
+            return res.status(403).json({ error: 'invalid code' });
+        }
+
+        const sessionId = randomSessionId();
+        const sessionExpires = admin.firestore.Timestamp.fromDate(new Date(Date.now() + 12 * 60 * 60 * 1000));
+        await db.collection('admin_sessions').doc(sessionId).set({
+            session_id: sessionId,
+            telegram_id,
+            role: 'specialist',
+            created_at: admin.firestore.FieldValue.serverTimestamp(),
+            expires_at: sessionExpires
+        });
+        await db.collection('admin_sessions_pending').doc(telegram_id).delete();
+
+        setAdminSessionCookie(res, sessionId);
+        return res.json({ ok: true });
+    } catch (error) {
+        await reportError('admin auth verify failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.post('/admin/auth/elevate', async (req, res) => {
+    try {
+        const sess = await getAdminSession(req);
+        if (!sess) return res.status(401).json({ error: 'unauthorized' });
+        const key = String(req.body?.key || '').trim();
+        if (!SUPER_ADMIN_KEY || key !== SUPER_ADMIN_KEY) return res.status(403).json({ error: 'invalid key' });
+        await db.collection('admin_sessions').doc(sess.session_id).set({ role: 'super_admin' }, { merge: true });
+        return res.json({ ok: true });
+    } catch (error) {
+        await reportError('admin elevate failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.post('/admin/auth/logout', async (req, res) => {
+    try {
+        const cookies = parseCookies(req.headers.cookie);
+        const sid = cookies.sf_admin_session;
+        if (sid) {
+            await db.collection('admin_sessions').doc(String(sid)).delete().catch(() => {});
+        }
+        clearAdminSessionCookie(res);
+        return res.json({ ok: true });
+    } catch (error) {
+        await reportError('admin logout failed', error);
+        clearAdminSessionCookie(res);
+        return res.json({ ok: true });
+    }
+});
+
+const requireSuperAdmin = async (req, res) => {
+    const sess = await getAdminSession(req);
+    if (!sess) return { ok: false, session: null, responseSent: res.status(401).json({ error: 'unauthorized' }) };
+    if (sess.role !== 'super_admin') return { ok: false, session: sess, responseSent: res.status(403).json({ error: 'forbidden' }) };
+    return { ok: true, session: sess, responseSent: null };
+};
+
+app.get('/admin/api/classrooms', async (req, res) => {
+    try {
+        const sess = await getAdminSession(req);
+        if (!sess) return res.status(401).json({ error: 'unauthorized' });
+
+        const classroomsQuery = sess.role === 'super_admin'
+            ? db.collection('classrooms')
+            : db.collection('classrooms').where('specialist_id', '==', String(sess.telegram_id));
+
+        const snap = await classroomsQuery.get();
+        const items = [];
+        for (const doc of snap.docs) {
+            const room = doc.data();
+            const groupId = String(room.group_id || doc.id);
+
+            const verSnap = await db.collection('group_verifications').where('group_id', '==', groupId).get();
+            const verified = verSnap.docs.filter(d => d.data().verified).length;
+            const removed = verSnap.docs.filter(d => d.data().removed).length;
+            const unverified = verSnap.size - verified - removed;
+
+            const settingsDoc = await db.collection('group_settings').doc(groupId).get();
+            const settings = settingsDoc.exists ? settingsDoc.data() : {};
+
+            items.push({
+                group_id: groupId,
+                group_name: room.group_name || groupId,
+                specialist_id: room.specialist_id || '',
+                specialist_name: room.specialist_name || '',
+                verification: { verified, unverified, removed },
+                campaign: { active: Boolean(settings.verify_campaign_active) },
+                can_manage: sess.role === 'super_admin'
+            });
+        }
+
+        return res.json({ items });
+    } catch (error) {
+        await reportError('admin classrooms api failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.get('/admin/api/today', async (req, res) => {
+    try {
+        const sess = await getAdminSession(req);
+        if (!sess) return res.status(401).json({ error: 'unauthorized' });
+        const todayStr = getLagosDateString();
+
+        const classesSnap = await db.collection('classes')
+            .where('date', '==', todayStr)
+            .where('status', '==', 'active')
+            .get();
+
+        const items = [];
+        for (const doc of classesSnap.docs) {
+            const c = doc.data();
+            if (sess.role !== 'super_admin' && String(c.specialist_id) !== String(sess.telegram_id)) continue;
+            items.push({
+                id: doc.id,
+                group_id: c.group_id,
+                group_name: c.group_name,
+                time: c.time,
+                topic: c.topic || null,
+                status: c.status
+            });
+        }
+
+        return res.json({ items });
+    } catch (error) {
+        await reportError('admin today api failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.post('/admin/api/classrooms/:groupId/start', async (req, res) => {
+    const auth = await requireSuperAdmin(req, res);
+    if (!auth.ok) return;
+    try {
+        await startVerifyCampaign(req.params.groupId);
+        return res.json({ ok: true });
+    } catch (error) {
+        await reportError('admin start campaign failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.post('/admin/api/classrooms/:groupId/stop', async (req, res) => {
+    const auth = await requireSuperAdmin(req, res);
+    if (!auth.ok) return;
+    try {
+        await stopVerifyCampaign(req.params.groupId);
+        return res.json({ ok: true });
+    } catch (error) {
+        await reportError('admin stop campaign failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.post('/admin/api/classrooms/:groupId/announce', async (req, res) => {
+    const auth = await requireSuperAdmin(req, res);
+    if (!auth.ok) return;
+    try {
+        const groupId = String(req.params.groupId);
+        await bot.telegram.sendMessage(groupId, '✅ Verification Required\n\nTap below to verify:', Markup.inlineKeyboard([
+            [Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))]
+        ]));
+        return res.json({ ok: true });
+    } catch (error) {
+        await reportError('admin announce verify failed', error);
+        return res.status(500).json({ error: 'failed' });
+    }
+});
+
+app.get('/admin/api/attendance/export', async (req, res) => {
+    try {
+        const sess = await getAdminSession(req);
+        if (!sess) return res.status(401).send('unauthorized');
+        const groupId = String(req.query.groupId || '').trim();
+        const from = String(req.query.from || '').trim();
+        const to = String(req.query.to || '').trim();
+        if (!groupId || !from || !to) return res.status(400).send('groupId, from, to required');
+
+        if (sess.role !== 'super_admin') {
+            const roomDoc = await db.collection('classrooms').doc(groupId).get();
+            if (!roomDoc.exists || String(roomDoc.data().specialist_id) !== String(sess.telegram_id)) {
+                return res.status(403).send('forbidden');
+            }
+        }
+
+        const classesSnap = await db.collection('classes')
+            .where('group_id', '==', groupId)
+            .where('date', '>=', from)
+            .where('date', '<=', to)
+            .get();
+
+        const classIds = classesSnap.docs.map(d => d.id);
+        const rows = [];
+        for (const classId of classIds) {
+            const attSnap = await db.collection('attendance').where('class_id', '==', classId).get();
+            for (const doc of attSnap.docs) {
+                const a = doc.data();
+                rows.push({ class_id: classId, user_id: a.user_id, attended: a.attended ? 'true' : 'false' });
+            }
+        }
+
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="attendance_${groupId}_${from}_to_${to}.csv"`);
+        res.write('class_id,user_id,attended\n');
+        for (const r of rows) res.write(`${r.class_id},${r.user_id},${r.attended}\n`);
+        res.end();
+    } catch (error) {
+        await reportError('attendance export failed', error);
+        return res.status(500).send('failed');
+    }
+});
 
 app.get('/questionnaire', async (req, res) => {
     try {

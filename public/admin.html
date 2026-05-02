@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Skillforge Bot Admin</title>
+    <link rel="stylesheet" href="/public/admin.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="row">
+        <h1>Skillforge Bot Admin</h1>
+        <div class="right">
+          <span id="role"></span>
+          <button id="logout" class="btn secondary" style="display:none;">Logout</button>
+        </div>
+      </header>
+
+      <section id="loginBox" class="card">
+        <h2>Login</h2>
+        <p>Enter your Telegram ID, request a code in DM, then verify it.</p>
+        <div class="grid">
+          <label>
+            Telegram ID
+            <input id="telegramId" placeholder="123456789" />
+          </label>
+          <button id="requestCode" class="btn">Request code</button>
+          <label>
+            Code
+            <input id="code" placeholder="123456" />
+          </label>
+          <button id="verifyCode" class="btn">Verify</button>
+        </div>
+        <hr/>
+        <p>Super admin: enter key to elevate.</p>
+        <div class="grid">
+          <label>
+            Super Admin Key
+            <input id="superKey" placeholder="SUPER_ADMIN_KEY" />
+          </label>
+          <button id="elevate" class="btn secondary">Elevate</button>
+        </div>
+        <div id="loginMsg" class="msg"></div>
+      </section>
+
+      <section id="app" style="display:none;">
+        <nav class="tabs">
+          <button class="tab active" data-tab="classrooms">Classrooms</button>
+          <button class="tab" data-tab="today">Today</button>
+          <button class="tab" data-tab="exports">Exports</button>
+        </nav>
+
+        <section id="tab-classrooms" class="card">
+          <h2>Classrooms</h2>
+          <table class="table" id="classroomsTable"></table>
+        </section>
+
+        <section id="tab-today" class="card" style="display:none;">
+          <h2>Today’s Classes</h2>
+          <table class="table" id="todayTable"></table>
+        </section>
+
+        <section id="tab-exports" class="card" style="display:none;">
+          <h2>Attendance Export</h2>
+          <div class="grid exports">
+            <label>Group ID <input id="exportGroupId" placeholder="-100..." /></label>
+            <label>From (YYYY-MM-DD) <input id="exportFrom" placeholder="2026-05-01" /></label>
+            <label>To (YYYY-MM-DD) <input id="exportTo" placeholder="2026-05-07" /></label>
+            <button id="exportBtn" class="btn">Download CSV</button>
+          </div>
+          <div id="exportMsg" class="msg"></div>
+        </section>
+      </section>
+    </div>
+
+    <script src="/public/admin.js"></script>
+  </body>
+</html>
