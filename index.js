@@ -88,6 +88,33 @@ const isSpecialist = async (userId) => {
     return doc.exists;
 };
 
+const getUserRole = async (userId) => {
+    const uid = String(userId);
+    const specialistDoc = await db.collection('specialists').doc(uid).get();
+    if (specialistDoc.exists) return { role: 'specialist' };
+
+    const verifiedSnap = await db.collection('group_verifications')
+        .where('user_id', '==', uid)
+        .where('verified', '==', true)
+        .where('removed', '==', false)
+        .limit(1)
+        .get();
+    if (!verifiedSnap.empty) return { role: 'trainee_verified' };
+
+    return { role: 'trainee_unverified' };
+};
+
+const requireSpecialist = async (ctx) => {
+    const uid = ctx.from?.id ? String(ctx.from.id) : null;
+    if (!uid) return false;
+    const ok = await isSpecialist(uid);
+    if (!ok) {
+        await ctx.reply('Staff only.');
+        return false;
+    }
+    return true;
+};
+
 const startVerifyCampaign = async (groupId) => {
     const docRef = db.collection('group_settings').doc(String(groupId));
     const now = admin.firestore.Timestamp.fromDate(new Date());
@@ -399,6 +426,7 @@ bot.command('register', async (ctx) => {
 
 bot.command('claim', async (ctx) => {
     try {
+        if (!(await requireSpecialist(ctx))) return;
         if (ctx.chat.type === 'private') {
             return ctx.reply('❌ You cannot claim a Direct Message! You must type this command inside the actual Skillforge Telegram Group.\n\n📍 Go to your Skillforge group → Type /claim');
         }
@@ -461,51 +489,69 @@ bot.command('claim', async (ctx) => {
 })
 
 bot.command('help', (ctx) => {
-    const helpText = `*Skillforge Bot Commands*
+    const userId = ctx.from?.id ? String(ctx.from.id) : null;
+    if (!userId) return;
+
+    getUserRole(userId).then(({ role }) => {
+        if (role !== 'specialist') {
+            const helpText = `*Skillforge Bot (Trainee)*
+
+• /verify - Verify your account (if you have a pending verification)
+• /attended - Mark attendance for today's class (DM only)
+• /missed - Mark absence for today's class (DM only)
+• /help - Show this help`;
+            return ctx.reply(helpText, { parse_mode: 'Markdown' });
+        }
+
+        const helpText = `*Skillforge Bot Commands*
 
 ` +
-        `â€¢ /register <password> - Register as a Specialist.
+            `â€¢ /register <password> - Register as a Specialist.
 ` +
-        `â€¢ /claim - Claim your Telegram classroom group.
+            `â€¢ /claim - Claim your Telegram classroom group.
 ` +
-        `â€¢ /setclass <group_id> <HH:MM> [topic] - Schedule todayâ€™s live session with optional topic.
+            `â€¢ /setclass <group_id> <HH:MM> [topic] - Schedule todayâ€™s live session with optional topic.
 ` +
-        `â€¢ /rescheduleclass <group_id> <old_time> <new_time> - Move a session to a new time.
+            `â€¢ /rescheduleclass <group_id> <old_time> <new_time> - Move a session to a new time.
 ` +
-        `â€¢ /cancelclass <group_id> [time] - Cancel one or all todayâ€™s sessions.
+            `â€¢ /cancelclass <group_id> [time] - Cancel one or all todayâ€™s sessions.
 ` +
-        `â€¢ /classlist - Show all upcoming live sessions for your classrooms.
+            `â€¢ /classlist - Show all upcoming live sessions for your classrooms.
 ` +
-        `â€¢ /status - Show your classroom status and todayâ€™s schedule.
+            `â€¢ /status - Show your classroom status and todayâ€™s schedule.
 ` +
-        `â€¢ /health - Check bot health and system status.
+            `â€¢ /health - Check bot health and system status.
 ` +
-        `â€¢ /attended - Confirm attendance for the current session (in DM).
+            `â€¢ /attended - Confirm attendance for the current session (in DM).
 ` +
-        `â€¢ /missed - Report missing the current session (in DM).
+            `â€¢ /missed - Report missing the current session (in DM).
 ` +
-        `â€¢ /backup <group_name> - Assign yourself as backup specialist.
+            `â€¢ /backup <group_name> - Assign yourself as backup specialist.
 ` +
-        `â€¢ /calendar [date] - List classes for a date (YYYY-MM-DD).
+            `â€¢ /calendar [date] - List classes for a date (YYYY-MM-DD).
 ` +
-        `â€¢ /report [date] - Get attendance report for your classes.
+            `â€¢ /report [date] - Get attendance report for your classes.
 ` +
-        `â€¢ /weeklyreport - Generate weekly summary report (Saturdays only).
+            `â€¢ /weeklyreport - Generate weekly summary report (Saturdays only).
 ` +
-        `â€¢ /setprogram <group_id> <YYYY-MM-DD> - Define course first class date and tracking plan.
+            `â€¢ /setprogram <group_id> <YYYY-MM-DD> - Define course first class date and tracking plan.
 ` +
-        `â€¢ /courseprogress <group_id> - Show weekly performance meter and plan progress.
+            `â€¢ /courseprogress <group_id> - Show weekly performance meter and plan progress.
 ` +
-        `â€¢ /questionnaire - Download the staff questionnaire PDF.
+            `â€¢ /questionnaire - Download the staff questionnaire PDF.
 ` +
-        `â€¢ /verify - Verify your trainee account in private chat.
+            `â€¢ /verify - Verify your trainee account in private chat.
 ` +
-        `â€¢ /help - Show this message.`;
-    ctx.reply(helpText, { parse_mode: 'Markdown' });
+            `â€¢ /help - Show this message.`;
+        return ctx.reply(helpText, { parse_mode: 'Markdown' });
+    }).catch(() => {
+        ctx.reply('Use /help again.');
+    });
 });
 
 bot.command('status', async (ctx) => {
     try {
+        if (!(await requireSpecialist(ctx))) return;
         if (ctx.chat.type === 'private') {
             const specialistId = ctx.from.id.toString();
             const specialistDoc = await db.collection('specialists').doc(specialistId).get();
@@ -578,6 +624,7 @@ bot.command('status', async (ctx) => {
 
 bot.command('classlist', async (ctx) => {
     try {
+        if (!(await requireSpecialist(ctx))) return;
         const specialistId = ctx.from.id.toString();
         const specialistDoc = await db.collection('specialists').doc(specialistId).get();
         if (!specialistDoc.exists) {
@@ -623,6 +670,7 @@ bot.command('classlist', async (ctx) => {
 
 bot.command('health', async (ctx) => {
     try {
+        if (!(await requireSpecialist(ctx))) return;
         const specialistId = ctx.from.id.toString();
         const specialistDoc = await db.collection('specialists').doc(specialistId).get();
         if (!specialistDoc.exists) {
@@ -771,6 +819,7 @@ bot.action(/^attendance_pick_(attended|missed)_(.+)$/, async (ctx) => {
 // Assign Backup Specialist
 bot.command('backup', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
 
     const userId = ctx.from.id.toString();
     const specialistDoc = await db.collection('specialists').doc(userId).get();
@@ -804,6 +853,7 @@ bot.command('backup', async (ctx) => {
 
 // Calendar: List classes for a specific date
 bot.command('calendar', async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return;
     const args = ctx.message.text.split(' ').slice(1);
     let dateStr = getLagosDateString();
     if (args.length > 0) {
@@ -831,6 +881,7 @@ bot.command('calendar', async (ctx) => {
 // Attendance Report for Specialists
 bot.command('report', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
 
     const userId = ctx.from.id.toString();
     const specialistDoc = await db.collection('specialists').doc(userId).get();
@@ -876,6 +927,7 @@ bot.command('report', async (ctx) => {
 // Weekly Report for Specialists (Available on Saturdays)
 bot.command('weeklyreport', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
 
     const userId = ctx.from.id.toString();
     const specialistDoc = await db.collection('specialists').doc(userId).get();
@@ -983,6 +1035,7 @@ bot.command('weeklyreport', async (ctx) => {
 
 bot.command('setprogram', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
 
     const args = ctx.message.text.split(' ').slice(1);
     if (args.length < 2) {
@@ -1028,6 +1081,7 @@ bot.command('setprogram', async (ctx) => {
 
 bot.command('courseprogress', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
 
     const args = ctx.message.text.split(' ').slice(1);
     if (args.length < 1) {
@@ -1086,6 +1140,7 @@ bot.command('courseprogress', async (ctx) => {
 
 bot.command('questionnaire', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
 
     const args = ctx.message.text.split(' ').slice(1);
     const specialistId = ctx.from.id.toString();
@@ -1398,19 +1453,54 @@ bot.action('start_report', async (ctx) => {
 });
 
 bot.action('help_info', (ctx) => {
-    ctx.reply(
-        `*📚 Skillforge Bot Help*\n\n` +
-        `*Key Commands:*\n` +
-        `📝 /register - Register as specialist\n` +
-        `🏢 /claim - Link your classroom\n` +
-        `📅 /setclass - Schedule class\n` +
-        `📊 /weeklyreport - Submit report\n` +
-        `❓ /help - Full help menu\n\n` +
-        `*Need More Help?*\n` +
-        `Contact: support@skillforge.com`,
-        { parse_mode: 'Markdown' }
-    );
-    ctx.answerCbQuery('Help opened');
+    const userId = ctx.from?.id ? String(ctx.from.id) : null;
+    if (!userId) return ctx.answerCbQuery();
+
+    getUserRole(userId).then(({ role }) => {
+        if (role !== 'specialist') {
+            ctx.reply(
+                `*📚 Skillforge Bot Help (Trainee)*\n\n` +
+                `*Key Commands:*\n` +
+                `✅ /verify - Verify your account\n` +
+                `🟢 /attended - Mark attendance (DM only)\n` +
+                `🔴 /missed - Mark absence (DM only)\n` +
+                `❓ /help - Full help\n\n` +
+                `If you can’t verify, join your classroom group and tap the Verify button there.`,
+                { parse_mode: 'Markdown' }
+            );
+        } else {
+            ctx.reply(
+                `*📚 Skillforge Bot Help (Staff)*\n\n` +
+                `*Key Commands:*\n` +
+                `📝 /register - Register as specialist\n` +
+                `🏢 /claim - Link your classroom\n` +
+                `📅 /setclass - Schedule class\n` +
+                `📊 /weeklyreport - Submit report\n` +
+                `❓ /help - Full help menu\n\n` +
+                `*Need More Help?*\n` +
+                `Contact: support@skillforge.com`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+        ctx.answerCbQuery('Help opened');
+    }).catch(() => {
+        ctx.answerCbQuery();
+    });
+});
+
+bot.action('trainee_attendance_help', async (ctx) => {
+    await ctx.reply('Use /attended or /missed in DM after a class. If multiple classes apply, you will be asked to pick one.');
+    ctx.answerCbQuery();
+});
+
+bot.action('trainee_verify', async (ctx) => {
+    try {
+        await handleVerification(ctx);
+    } catch (error) {
+        await reportError('trainee verify callback failed', error);
+        await ctx.reply('❌ Unable to verify right now. Please try again later.');
+    }
+    ctx.answerCbQuery();
 });
 
 bot.action(/^setup_program_(.+)$/, async (ctx) => {
@@ -1577,6 +1667,7 @@ const scheduleLiveClass = async ({ groupId, specialistId, timeInput, topic, date
 };
 
 bot.command('setclass', async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return;
     try {
         const args = ctx.message.text.split(' ');
         const groupId = args[1];
@@ -1612,6 +1703,7 @@ bot.command('setclass', async (ctx) => {
 });
 
 bot.command('cancelclass', async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return;
     try {
         const args = ctx.message.text.split(' ');
         const groupId = args[1];
@@ -2101,6 +2193,9 @@ bot.start(async (ctx) => {
         return await handleVerification(ctx, groupId);
     }
 
+    const roleInfo = await getUserRole(userId);
+    const isStaff = roleInfo.role === 'specialist';
+
     if (payload === 'register') {
         return ctx.reply(`To register as a specialist, use:\n/register YOUR_PASSWORD\n\nIf you don't have the password, contact your head of units.`);
     }
@@ -2110,14 +2205,17 @@ bot.start(async (ctx) => {
     }
 
     if (payload === 'schedule') {
+        if (!isStaff) return ctx.reply('Staff only.');
         return await sendScheduleGroupPicker(ctx, userId);
     }
 
     if (payload === 'classes') {
+        if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Use /classlist in a private chat to see your upcoming classes.');
     }
 
     if (payload === 'report') {
+        if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Choose a report type:', Markup.inlineKeyboard([
             [Markup.button.callback('Weekly Report', 'report_weekly')],
             [Markup.button.callback('Attendance Report', 'report_attendance')],
@@ -2126,10 +2224,12 @@ bot.start(async (ctx) => {
     }
 
     if (payload === 'progress') {
+        if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Use /courseprogress <group_id> in a private chat to view course progress.');
     }
 
     if (payload === 'weekly') {
+        if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('On Saturdays, use /weeklyreport to generate your weekly summary or /questionnaire to complete the weekly review.');
     }
 
@@ -2138,6 +2238,7 @@ bot.start(async (ctx) => {
     }
 
     if (payload === 'settings') {
+        if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Settings options:', Markup.inlineKeyboard([
             [Markup.button.callback('Change Name', 'settings_name')],
             [Markup.button.callback('View Profile', 'settings_profile')]
@@ -2148,39 +2249,41 @@ bot.start(async (ctx) => {
         return ctx.reply('Unknown action. Use /help to see available commands.');
     }
 
-    {
-        // Check if registered specialist
+    if (roleInfo.role === 'specialist') {
         const specialistDoc = await db.collection('specialists').doc(userId).get();
-        if (specialistDoc.exists) {
-            const specialistData = specialistDoc.data();
-            // Show menu for specialists with improved UI
-            ctx.reply(
-                `*👋 Welcome back, ${specialistData.name || 'Specialist'}!*\n\n` +
-                `Select an option below to get started:`,
-                Markup.inlineKeyboard([
-                    [Markup.button.callback('📋 Dashboard', 'dashboard')],
-                    [Markup.button.callback('📅 Schedule Class', 'schedule_class')],
-                    [Markup.button.callback('📊 Submit Report', 'submit_report')],
-                    [Markup.button.url('🌐 Full Menu', `${SERVER_URL}/menu`)],
-                    [Markup.button.callback('❓ Help', 'help_info')]
-                ])
-            );
-        } else {
-            ctx.reply(
-                `*Welcome to Skillforge Bot!* 🎓\n\n` +
-                `I'm your classroom management assistant.\n\n` +
-                `*For Specialists:*\n` +
-                `📝 Use /register [password] to register\n\n` +
-                `*For Trainees:*\n` +
-                `✅ Join a group to verify your account\n\n` +
-                `🌐 View the full menu below:`,
-                Markup.inlineKeyboard([
-                    [Markup.button.url('📖 Open Menu', `${SERVER_URL}/menu`)],
-                    [Markup.button.callback('❓ Help', 'help_info')]
-                ])
-            );
+        const specialistData = specialistDoc.exists ? specialistDoc.data() : {};
+        const buttons = [
+            [Markup.button.callback('📋 Dashboard', 'dashboard')],
+            [Markup.button.callback('📅 Schedule Class', 'schedule_class')],
+            [Markup.button.callback('📊 Submit Report', 'submit_report')]
+        ];
+        if (SERVER_URL) {
+            buttons.push([Markup.button.url('🌐 Full Menu', `${SERVER_URL}/menu`)]);
         }
+        buttons.push([Markup.button.callback('❓ Help', 'help_info')]);
+        return ctx.reply(
+            `*👋 Welcome back, ${specialistData.name || 'Specialist'}!*\n\nSelect an option below to get started:`,
+            { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+        );
     }
+
+    if (roleInfo.role === 'trainee_verified') {
+        return ctx.reply(
+            `*Welcome!* 🎓\n\nUse the buttons below for trainee actions:`,
+            { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+                [Markup.button.callback('✅ Attendance', 'trainee_attendance_help')],
+                [Markup.button.callback('❓ Help', 'help_info')]
+            ]) }
+        );
+    }
+
+    return ctx.reply(
+        `*Welcome!* 🎓\n\nTo participate in a classroom, please verify your account. Join your classroom group and tap the Verify button there, or use /verify if you already have a pending verification.`,
+        { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Verify', 'trainee_verify')],
+            [Markup.button.callback('❓ Help', 'help_info')]
+        ]) }
+    );
 })
 
 // Menu handlers
