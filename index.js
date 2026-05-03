@@ -2956,6 +2956,12 @@ const botRuntime = {
     launched: false,
     launch_error: null,
     telegram_me: null,
+    polling: {
+        state: 'init',
+        launch_attempt: 0,
+        last_error: null,
+        last_error_at: null
+    },
     polling_lock: {
         enabled: true,
         acquired: false,
@@ -2973,6 +2979,7 @@ app.get('/_diag', async (req, res) => {
             launched: botRuntime.launched,
             launch_error: botRuntime.launch_error,
             telegram_me: botRuntime.telegram_me,
+            polling: botRuntime.polling,
             polling_lock: botRuntime.polling_lock
         });
     } catch {
@@ -3067,18 +3074,24 @@ const acquirePollingLock = async () => {
 const startBot = async () => {
     try {
         console.log('Starting Telegram bot (polling mode)...');
+        botRuntime.polling.state = 'getMe';
         try {
             botRuntime.telegram_me = await bot.telegram.getMe();
             console.log(`Bot token is for @${botRuntime.telegram_me?.username || 'unknown'}`);
         } catch (error) {
             botRuntime.launch_error = String(error?.message || error || 'getMe failed');
+            botRuntime.polling.last_error = botRuntime.launch_error;
+            botRuntime.polling.last_error_at = new Date().toISOString();
             throw error;
         }
 
+        botRuntime.polling.state = 'lock_wait';
         for (let attempt = 1; attempt <= 60; attempt++) {
             const lockOk = await acquirePollingLock();
             if (lockOk) break;
             botRuntime.launch_error = 'polling lock not acquired (another instance active)';
+            botRuntime.polling.last_error = botRuntime.launch_error;
+            botRuntime.polling.last_error_at = new Date().toISOString();
             const owner = botRuntime.polling_lock.owner ? `owner=${botRuntime.polling_lock.owner}` : 'owner=unknown';
             const exp = botRuntime.polling_lock.expires_at ? `expires_at=${botRuntime.polling_lock.expires_at}` : 'expires_at=unknown';
             console.error(`Polling lock not acquired. Waiting... (${attempt}/60) ${owner} ${exp}`);
@@ -3088,21 +3101,28 @@ const startBot = async () => {
 
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
-        for (let attempt = 1; attempt <= 12; attempt++) {
+        botRuntime.polling.state = 'launching';
+        for (let attempt = 1; attempt <= 360; attempt++) {
             try {
+                botRuntime.polling.launch_attempt = attempt;
                 await bot.launch({ dropPendingUpdates: true });
                 botRuntime.launched = true;
                 botRuntime.launch_error = null;
+                botRuntime.polling.state = 'running';
                 console.log('Skillforge Bot launched in polling mode');
                 break;
             } catch (error) {
                 const message = String(error?.message || error || '');
                 const isConflict = message.includes('409') && message.toLowerCase().includes('getupdates');
-                if (!isConflict || attempt === 12) throw error;
-                console.error(`Polling conflict (409). Another instance is using getUpdates. Retry ${attempt}/12 in 10s...`);
+                botRuntime.polling.last_error = message;
+                botRuntime.polling.last_error_at = new Date().toISOString();
+                botRuntime.launch_error = message;
+                if (!isConflict) throw error;
+                console.error(`Polling conflict (409). Another instance is using getUpdates. Retry ${attempt}/360 in 10s...`);
                 await sleep(10_000);
             }
         }
+        if (!botRuntime.launched) return;
 
         await bot.telegram.setMyCommands([
             { command: 'start', description: 'Start the bot and show menu' },
