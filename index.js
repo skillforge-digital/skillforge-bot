@@ -1418,9 +1418,10 @@ bot.on('text', async (ctx) => {
 
 bot.action('dashboard', (ctx) => {
     requireSpecialist(ctx).then((ok) => {
-        if (!ok) return;
+        if (!ok) return ctx.answerCbQuery();
         ctx.reply('📋 Dashboard coming soon! Use /status to see your daily overview.');
-    });
+        ctx.answerCbQuery();
+    }).catch(() => ctx.answerCbQuery());
 });
 
 bot.action('schedule_class', async (ctx) => {
@@ -2190,34 +2191,35 @@ bot.action(/^verify_select_(.+)$/, async (ctx) => {
 bot.start(async (ctx) => {
     const payload = ctx.startPayload;
     const userId = ctx.from.id.toString();
+    const normalizedPayload = payload === 'start' || payload === 'menu' ? null : payload;
 
-    if (payload === 'verify' || (payload && payload.startsWith('verify_'))) {
-        const groupId = payload && payload.startsWith('verify_') ? decodeURIComponent(payload.slice('verify_'.length)) : null;
+    if (normalizedPayload === 'verify' || (normalizedPayload && normalizedPayload.startsWith('verify_'))) {
+        const groupId = normalizedPayload && normalizedPayload.startsWith('verify_') ? decodeURIComponent(normalizedPayload.slice('verify_'.length)) : null;
         return await handleVerification(ctx, groupId);
     }
 
     const roleInfo = await getUserRole(userId);
     const isStaff = roleInfo.role === 'specialist';
 
-    if (payload === 'register') {
+    if (normalizedPayload === 'register') {
         return ctx.reply(`To register as a specialist, use:\n/register YOUR_PASSWORD\n\nIf you don't have the password, contact your head of units.`);
     }
 
-    if (payload === 'claim') {
+    if (normalizedPayload === 'claim') {
         return ctx.reply(`To claim a classroom, go to your Telegram group, add me as an admin, and type:\n/claim`);
     }
 
-    if (payload === 'schedule') {
+    if (normalizedPayload === 'schedule') {
         if (!isStaff) return ctx.reply('Staff only.');
         return await sendScheduleGroupPicker(ctx, userId);
     }
 
-    if (payload === 'classes') {
+    if (normalizedPayload === 'classes') {
         if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Use /classlist in a private chat to see your upcoming classes.');
     }
 
-    if (payload === 'report') {
+    if (normalizedPayload === 'report') {
         if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Choose a report type:', Markup.inlineKeyboard([
             [Markup.button.callback('Weekly Report', 'report_weekly')],
@@ -2226,21 +2228,21 @@ bot.start(async (ctx) => {
         ]));
     }
 
-    if (payload === 'progress') {
+    if (normalizedPayload === 'progress') {
         if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Use /courseprogress <group_id> in a private chat to view course progress.');
     }
 
-    if (payload === 'weekly') {
+    if (normalizedPayload === 'weekly') {
         if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('On Saturdays, use /weeklyreport to generate your weekly summary or /questionnaire to complete the weekly review.');
     }
 
-    if (payload === 'help') {
+    if (normalizedPayload === 'help') {
         return ctx.reply('Use /help to see the full commands list.');
     }
 
-    if (payload === 'settings') {
+    if (normalizedPayload === 'settings') {
         if (!isStaff) return ctx.reply('Staff only.');
         return ctx.reply('Settings options:', Markup.inlineKeyboard([
             [Markup.button.callback('Change Name', 'settings_name')],
@@ -2248,7 +2250,7 @@ bot.start(async (ctx) => {
         ]));
     }
 
-    if (payload) {
+    if (normalizedPayload) {
         return ctx.reply('Unknown action. Use /help to see available commands.');
     }
 
