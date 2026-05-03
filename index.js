@@ -2911,7 +2911,8 @@ const startBot = async () => {
                 process.exit(1);
             }
             const webhookUrl = `${SERVER_URL}${WEBHOOK_PATH}`;
-            app.use(WEBHOOK_PATH, bot.webhookCallback(WEBHOOK_PATH));
+            console.log('Webhook mode enabled. Waiting for Telegram updates.');
+            app.use(bot.webhookCallback(WEBHOOK_PATH));
             await bot.telegram.setWebhook(webhookUrl);
             console.log(`Bot webhook configured at ${webhookUrl}`);
         } else {

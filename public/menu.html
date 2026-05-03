@@ -250,5 +250,18 @@
             <p style="margin-top: 8px; font-size: 11px;">Tap any button to interact with the bot →</p>
         </div>
     </div>
+    <script>
+        (function () {
+            if (!window.Telegram || !window.Telegram.WebApp) return;
+            const tg = window.Telegram.WebApp;
+            try { tg.ready(); } catch (e) {}
+            document.querySelectorAll('a[href^="https://t.me/"]').forEach((a) => {
+                a.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    try { tg.openTelegramLink(a.href); } catch (err) { window.location.href = a.href; }
+                });
+            });
+        })();
+    </script>
 </body>
 </html>
