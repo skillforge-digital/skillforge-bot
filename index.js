@@ -86,6 +86,18 @@ const getBotDirectMessageLink = () => `https://t.me/${BOT_USERNAME_SAFE}`;
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+bot.use(async (ctx, next) => {
+    try {
+        const text = ctx.message?.text;
+        if (text) {
+            console.log(`Incoming message: ${text} from ${ctx.from?.id || 'unknown'} chat=${ctx.chat?.id || 'unknown'}`);
+        } else if (ctx.updateType) {
+            console.log(`Incoming updateType=${ctx.updateType}`);
+        }
+    } catch {}
+    return next();
+});
+
 bot.catch(async (error, ctx) => {
     try {
         await reportError('Telegraf handler error', error);
@@ -2257,6 +2269,7 @@ bot.start(async (ctx) => {
         const payload = ctx.startPayload;
         const userId = ctx.from.id.toString();
         const normalizedPayload = payload === 'start' || payload === 'menu' ? null : payload;
+        console.log(`Start handler: user=${userId} payload=${normalizedPayload || ''}`);
 
         if (normalizedPayload === 'verify' || (normalizedPayload && normalizedPayload.startsWith('verify_'))) {
             const groupId = normalizedPayload && normalizedPayload.startsWith('verify_') ? decodeURIComponent(normalizedPayload.slice('verify_'.length)) : null;
@@ -2265,6 +2278,7 @@ bot.start(async (ctx) => {
 
         const roleInfo = await getUserRole(userId);
         const isStaff = roleInfo.role === 'specialist';
+        console.log(`Start role resolved: user=${userId} role=${roleInfo.role}`);
 
         if (normalizedPayload === 'register') {
             return ctx.reply(`To register as a specialist, use:\n/register YOUR_PASSWORD\n\nIf you don't have the password, contact your head of units.`);
