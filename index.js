@@ -2956,11 +2956,25 @@ bot.catch(async (err, ctx) => {
     await reportError('Unhandled bot error', err);
 });
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const startBot = async () => {
     try {
-        await bot.telegram.deleteWebhook();
-        await bot.launch();
-        console.log('Skillforge Bot launched in polling mode');
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+
+        for (let attempt = 1; attempt <= 12; attempt++) {
+            try {
+                await bot.launch({ dropPendingUpdates: true });
+                console.log('Skillforge Bot launched in polling mode');
+                break;
+            } catch (error) {
+                const message = String(error?.message || error || '');
+                const isConflict = message.includes('409') && message.toLowerCase().includes('getupdates');
+                if (!isConflict || attempt === 12) throw error;
+                console.error(`Polling conflict (409). Another instance is using getUpdates. Retry ${attempt}/12 in 10s...`);
+                await sleep(10_000);
+            }
+        }
 
         await bot.telegram.setMyCommands([
             { command: 'start', description: 'Start the bot and show menu' },
