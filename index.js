@@ -2955,7 +2955,13 @@ const botRuntime = {
     started_at: new Date().toISOString(),
     launched: false,
     launch_error: null,
-    telegram_me: null
+    telegram_me: null,
+    polling_lock: {
+        enabled: true,
+        acquired: false,
+        owner: null,
+        expires_at: null
+    }
 };
 
 app.get('/_diag', async (req, res) => {
@@ -2966,7 +2972,8 @@ app.get('/_diag', async (req, res) => {
             bot_username_env: BOT_USERNAME_SAFE,
             launched: botRuntime.launched,
             launch_error: botRuntime.launch_error,
-            telegram_me: botRuntime.telegram_me
+            telegram_me: botRuntime.telegram_me,
+            polling_lock: botRuntime.polling_lock
         });
     } catch {
         return res.status(500).json({ ok: false });
@@ -2980,6 +2987,64 @@ bot.catch(async (err, ctx) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const POLLING_LOCK_DOC = db.collection('runtime').doc('polling_lock');
+const POLLING_LOCK_TTL_MS = 90_000;
+const POLLING_LOCK_REFRESH_MS = 30_000;
+const INSTANCE_ID = require('crypto').randomBytes(12).toString('hex');
+let pollingLockInterval = null;
+
+const acquirePollingLock = async () => {
+    const now = Date.now();
+    const expiresAt = admin.firestore.Timestamp.fromDate(new Date(now + POLLING_LOCK_TTL_MS));
+    const acquired = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(POLLING_LOCK_DOC);
+        if (snap.exists) {
+            const data = snap.data() || {};
+            const currentExpires = data.expires_at?.toDate ? data.expires_at.toDate().getTime() : 0;
+            const currentOwner = data.owner || null;
+            if (currentExpires > now && currentOwner && currentOwner !== INSTANCE_ID) return false;
+        }
+        tx.set(POLLING_LOCK_DOC, {
+            owner: INSTANCE_ID,
+            expires_at: expiresAt,
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        return true;
+    });
+
+    botRuntime.polling_lock.acquired = acquired;
+    botRuntime.polling_lock.owner = acquired ? INSTANCE_ID : null;
+    botRuntime.polling_lock.expires_at = expiresAt.toDate().toISOString();
+
+    if (!acquired) return false;
+
+    pollingLockInterval = setInterval(async () => {
+        try {
+            const snap = await POLLING_LOCK_DOC.get();
+            const data = snap.exists ? snap.data() : null;
+            if (!data || data.owner !== INSTANCE_ID) {
+                botRuntime.polling_lock.acquired = false;
+                botRuntime.polling_lock.owner = null;
+                if (botRuntime.launched) {
+                    try { await bot.stop('lost_lock'); } catch {}
+                }
+                clearInterval(pollingLockInterval);
+                pollingLockInterval = null;
+                return;
+            }
+            const refreshExpires = admin.firestore.Timestamp.fromDate(new Date(Date.now() + POLLING_LOCK_TTL_MS));
+            await POLLING_LOCK_DOC.set({
+                owner: INSTANCE_ID,
+                expires_at: refreshExpires,
+                updated_at: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+            botRuntime.polling_lock.expires_at = refreshExpires.toDate().toISOString();
+        } catch {}
+    }, POLLING_LOCK_REFRESH_MS);
+
+    return true;
+};
+
 const startBot = async () => {
     try {
         console.log('Starting Telegram bot (polling mode)...');
@@ -2989,6 +3054,13 @@ const startBot = async () => {
         } catch (error) {
             botRuntime.launch_error = String(error?.message || error || 'getMe failed');
             throw error;
+        }
+
+        const lockOk = await acquirePollingLock();
+        if (!lockOk) {
+            botRuntime.launch_error = 'polling lock not acquired (another instance active)';
+            console.error('Polling lock not acquired. Another instance is active; this instance will only serve HTTP.');
+            return;
         }
 
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
