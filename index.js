@@ -2951,6 +2951,28 @@ const WEBHOOK_PATH = null;
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
+const botRuntime = {
+    started_at: new Date().toISOString(),
+    launched: false,
+    launch_error: null,
+    telegram_me: null
+};
+
+app.get('/_diag', async (req, res) => {
+    try {
+        return res.json({
+            ok: true,
+            server_time: new Date().toISOString(),
+            bot_username_env: BOT_USERNAME_SAFE,
+            launched: botRuntime.launched,
+            launch_error: botRuntime.launch_error,
+            telegram_me: botRuntime.telegram_me
+        });
+    } catch {
+        return res.status(500).json({ ok: false });
+    }
+});
+
 bot.catch(async (err, ctx) => {
     console.error('Bot update failed:', err?.message || err, 'Update type:', ctx?.updateType);
     await reportError('Unhandled bot error', err);
@@ -2960,11 +2982,22 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const startBot = async () => {
     try {
+        console.log('Starting Telegram bot (polling mode)...');
+        try {
+            botRuntime.telegram_me = await bot.telegram.getMe();
+            console.log(`Bot token is for @${botRuntime.telegram_me?.username || 'unknown'}`);
+        } catch (error) {
+            botRuntime.launch_error = String(error?.message || error || 'getMe failed');
+            throw error;
+        }
+
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
         for (let attempt = 1; attempt <= 12; attempt++) {
             try {
                 await bot.launch({ dropPendingUpdates: true });
+                botRuntime.launched = true;
+                botRuntime.launch_error = null;
                 console.log('Skillforge Bot launched in polling mode');
                 break;
             } catch (error) {
@@ -2999,6 +3032,8 @@ const startBot = async () => {
 
         console.log('Skillforge Bot is fully operational!');
     } catch (error) {
+        botRuntime.launched = false;
+        botRuntime.launch_error = String(error?.message || error || 'startup failed');
         console.error('Failed to start Skillforge Bot:', error?.message || error);
         await reportError('Bot startup failure', error);
         process.exit(1);
