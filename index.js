@@ -2946,8 +2946,8 @@ app.get('/review/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const isWebhookMode = false;
-const WEBHOOK_PATH = null;
+const isWebhookMode = Boolean(SERVER_URL && WEBHOOK_SECRET);
+const WEBHOOK_PATH = isWebhookMode ? `/webhook/${WEBHOOK_SECRET}` : null;
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
@@ -2976,6 +2976,7 @@ app.get('/_diag', async (req, res) => {
             ok: true,
             server_time: new Date().toISOString(),
             bot_username_env: BOT_USERNAME_SAFE,
+            mode: isWebhookMode ? 'webhook' : 'polling',
             launched: botRuntime.launched,
             launch_error: botRuntime.launch_error,
             telegram_me: botRuntime.telegram_me,
@@ -3083,6 +3084,18 @@ const startBot = async () => {
             botRuntime.polling.last_error = botRuntime.launch_error;
             botRuntime.polling.last_error_at = new Date().toISOString();
             throw error;
+        }
+
+        if (isWebhookMode) {
+            botRuntime.polling.state = 'webhook';
+            const webhookUrl = `${SERVER_URL}${WEBHOOK_PATH}`;
+            await bot.telegram.setWebhook(webhookUrl, { drop_pending_updates: true });
+            app.use(bot.webhookCallback(WEBHOOK_PATH));
+            botRuntime.launched = true;
+            botRuntime.launch_error = null;
+            console.log(`Bot webhook configured at ${webhookUrl}`);
+            console.log('Skillforge Bot is fully operational!');
+            return;
         }
 
         botRuntime.polling.state = 'lock_wait';
