@@ -11,6 +11,7 @@ const express = require('express');
 // SETUP & CONNECTIONS
 // ==========================================
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json());
 
 // SAFELY CONNECT TO FIREBASE
@@ -1214,33 +1215,31 @@ bot.command('questionnaire', async (ctx) => {
 });
 
 bot.action('report_weekly', async (ctx) => {
-    const specialistId = ctx.from.id.toString();
-    // Trigger weekly report logic
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     ctx.editMessageText('Generating weekly report...');
-    // Call the weeklyreport command logic here
     ctx.answerCbQuery();
 });
 
 bot.action('report_attendance', async (ctx) => {
-    const specialistId = ctx.from.id.toString();
-    // Trigger attendance report
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     ctx.editMessageText('Generating attendance report...');
     ctx.answerCbQuery();
 });
 
 bot.action('report_progress', async (ctx) => {
-    const specialistId = ctx.from.id.toString();
-    // Trigger course progress
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     ctx.editMessageText('Generating course progress report...');
     ctx.answerCbQuery();
 });
 
 bot.action('settings_name', async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     ctx.editMessageText('To change your name, reply with your new name.');
     ctx.answerCbQuery();
 });
 
 bot.action('settings_profile', async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     const specialistId = ctx.from.id.toString();
     const specialistDoc = await db.collection('specialists').doc(specialistId).get();
     if (specialistDoc.exists) {
@@ -1418,20 +1417,21 @@ bot.on('text', async (ctx) => {
 // ==========================================
 
 bot.action('dashboard', (ctx) => {
-    ctx.reply('📋 Dashboard coming soon! Use /status to see your daily overview.');
+    requireSpecialist(ctx).then((ok) => {
+        if (!ok) return;
+        ctx.reply('📋 Dashboard coming soon! Use /status to see your daily overview.');
+    });
 });
 
 bot.action('schedule_class', async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     const userId = ctx.from.id.toString();
-    const specialistDoc = await db.collection('specialists').doc(userId).get();
-    if (!specialistDoc.exists) {
-        return ctx.answerCbQuery('You must be a registered specialist');
-    }
     await sendScheduleGroupPicker(ctx, userId);
     ctx.answerCbQuery();
 });
 
-bot.action('submit_report', (ctx) => {
+bot.action('submit_report', async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     const today = new Date();
     if (today.getDay() !== 6) {
         return ctx.answerCbQuery('Reports can only be submitted on Saturdays!');
@@ -1441,15 +1441,13 @@ bot.action('submit_report', (ctx) => {
             [Markup.button.callback('Start Report Now', 'start_report')]
         ])
     );
+    ctx.answerCbQuery();
 });
 
 bot.action('start_report', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const specialistDoc = await db.collection('specialists').doc(userId).get();
-    if (!specialistDoc.exists) {
-        return ctx.answerCbQuery('Registration required');
-    }
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     ctx.reply('📊 Weekly Report started. Please answer the questions...');
+    ctx.answerCbQuery();
 });
 
 bot.action('help_info', (ctx) => {
@@ -1504,6 +1502,7 @@ bot.action('trainee_verify', async (ctx) => {
 });
 
 bot.action(/^setup_program_(.+)$/, async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     const groupId = ctx.match[1];
     ctx.reply(
         `📅 *Setup Program Date*\n\n` +
@@ -1511,6 +1510,7 @@ bot.action(/^setup_program_(.+)$/, async (ctx) => {
         `Example: 2026-04-24`,
         { parse_mode: 'Markdown' }
     );
+    ctx.answerCbQuery();
 });
 
 const beginScheduleSession = async (ctx, groupId, dateStr = null) => {
@@ -1547,6 +1547,7 @@ const beginScheduleSession = async (ctx, groupId, dateStr = null) => {
 };
 
 bot.action(/^schedule_(.+)$/, async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     const groupId = ctx.match[1];
     try {
         await beginScheduleSession(ctx, groupId);
@@ -1584,6 +1585,7 @@ cron.schedule('0 8 * * *', async () => {
 }, { timezone: "Africa/Lagos" });
 
 bot.action(/^daily_prompt_yes_(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})$/, async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     const groupId = ctx.match[1];
     const dateStr = ctx.match[2];
     try {
@@ -1599,6 +1601,7 @@ bot.action(/^daily_prompt_yes_(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})$/, async (ctx) =
 });
 
 bot.action(/^daily_prompt_no_(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})$/, async (ctx) => {
+    if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
     const groupId = ctx.match[1];
     try {
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
@@ -2520,6 +2523,7 @@ app.get('/public/menu.html', (req, res) => res.redirect('/menu'));
 app.use('/public', express.static('public'));
 
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
+app.get('/admin/', (req, res) => res.redirect('/admin'));
 
 const getAdminSession = async (req) => {
     const cookies = parseCookies(req.headers.cookie);
@@ -2533,8 +2537,18 @@ const getAdminSession = async (req) => {
     return sess;
 };
 
-const setAdminSessionCookie = (res, sessionId) => {
-    const base = `sf_admin_session=${encodeURIComponent(String(sessionId))}; Path=/; HttpOnly; SameSite=Lax`;
+const isHttpsRequest = (req) => {
+    if (req?.secure) return true;
+    const xfProto = req?.headers?.['x-forwarded-proto'];
+    if (xfProto && String(xfProto).toLowerCase() === 'https') return true;
+    if (SERVER_URL && SERVER_URL.startsWith('https://')) return true;
+    return false;
+};
+
+const setAdminSessionCookie = (req, res, sessionId) => {
+    const secure = isHttpsRequest(req);
+    const secureFlag = secure ? '; Secure' : '';
+    const base = `sf_admin_session=${encodeURIComponent(String(sessionId))}; Path=/; HttpOnly; SameSite=Lax${secureFlag}`;
     res.setHeader('Set-Cookie', base);
 };
 
@@ -2609,7 +2623,7 @@ app.post('/admin/auth/verify', async (req, res) => {
         });
         await db.collection('admin_sessions_pending').doc(telegram_id).delete();
 
-        setAdminSessionCookie(res, sessionId);
+        setAdminSessionCookie(req, res, sessionId);
         return res.json({ ok: true });
     } catch (error) {
         await reportError('admin auth verify failed', error);
