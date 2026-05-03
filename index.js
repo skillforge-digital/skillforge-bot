@@ -2993,6 +2993,18 @@ const POLLING_LOCK_REFRESH_MS = 30_000;
 const INSTANCE_ID = require('crypto').randomBytes(12).toString('hex');
 let pollingLockInterval = null;
 
+const readPollingLockDoc = async () => {
+    try {
+        const snap = await POLLING_LOCK_DOC.get();
+        if (!snap.exists) return null;
+        const data = snap.data() || {};
+        const expiresAt = data.expires_at?.toDate ? data.expires_at.toDate().toISOString() : null;
+        return { owner: data.owner || null, expires_at: expiresAt };
+    } catch {
+        return null;
+    }
+};
+
 const acquirePollingLock = async () => {
     const now = Date.now();
     const expiresAt = admin.firestore.Timestamp.fromDate(new Date(now + POLLING_LOCK_TTL_MS));
@@ -3016,7 +3028,14 @@ const acquirePollingLock = async () => {
     botRuntime.polling_lock.owner = acquired ? INSTANCE_ID : null;
     botRuntime.polling_lock.expires_at = expiresAt.toDate().toISOString();
 
-    if (!acquired) return false;
+    if (!acquired) {
+        const current = await readPollingLockDoc();
+        if (current) {
+            botRuntime.polling_lock.owner = current.owner;
+            botRuntime.polling_lock.expires_at = current.expires_at;
+        }
+        return false;
+    }
 
     pollingLockInterval = setInterval(async () => {
         try {
@@ -3056,12 +3075,16 @@ const startBot = async () => {
             throw error;
         }
 
-        const lockOk = await acquirePollingLock();
-        if (!lockOk) {
+        for (let attempt = 1; attempt <= 60; attempt++) {
+            const lockOk = await acquirePollingLock();
+            if (lockOk) break;
             botRuntime.launch_error = 'polling lock not acquired (another instance active)';
-            console.error('Polling lock not acquired. Another instance is active; this instance will only serve HTTP.');
-            return;
+            const owner = botRuntime.polling_lock.owner ? `owner=${botRuntime.polling_lock.owner}` : 'owner=unknown';
+            const exp = botRuntime.polling_lock.expires_at ? `expires_at=${botRuntime.polling_lock.expires_at}` : 'expires_at=unknown';
+            console.error(`Polling lock not acquired. Waiting... (${attempt}/60) ${owner} ${exp}`);
+            await sleep(10_000);
         }
+        if (!botRuntime.polling_lock.acquired) return;
 
         await bot.telegram.deleteWebhook({ drop_pending_updates: true });
 
