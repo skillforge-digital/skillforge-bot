@@ -63,6 +63,23 @@ const serveMenuHtml = (res) => {
 app.get('/', (req, res) => serveMenuHtml(res));
 app.get('/menu', (req, res) => serveMenuHtml(res));
 
+app.post('/api/webapp/role', async (req, res) => {
+    try {
+        const initData = String(req.body?.initData || '').trim();
+        if (!initData) return res.status(400).json({ ok: false, error: 'initData required' });
+        const verified = verifyTelegramInitData(initData, process.env.BOT_TOKEN);
+        if (!verified.ok) return res.status(401).json({ ok: false, error: verified.error });
+
+        const userId = String(verified.user.id);
+        const specialistDoc = await db.collection('specialists').doc(userId).get();
+        const role = specialistDoc.exists ? 'specialist' : 'public';
+        return res.json({ ok: true, role, user_id: userId });
+    } catch (error) {
+        await reportError('webapp role failed', error);
+        return res.status(500).json({ ok: false, error: 'failed' });
+    }
+});
+
 // Utility function to generate bot mention
 const getBotMention = () => `@${BOT_USERNAME_SAFE}`;
 const getBotDirectMessageLink = () => `https://t.me/${BOT_USERNAME_SAFE}`;
@@ -83,6 +100,28 @@ bot.catch(async (error, ctx) => {
 const getClassDocId = (groupId, date, time) => `${groupId}_${date}_${time}`;
 const normalizeUserIds = (userIds) => [...new Set(userIds.filter(Boolean).map(String))];
 const getVerificationDocId = (groupId, userId) => `${groupId}_${userId}`;
+
+const verifyTelegramInitData = (initData, botToken) => {
+    const crypto = require('crypto');
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash');
+    if (!hash) return { ok: false, error: 'missing hash' };
+    params.delete('hash');
+
+    const dataCheckString = Array.from(params.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}=${v}`)
+        .join('\n');
+
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+    const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+    if (computedHash !== hash) return { ok: false, error: 'bad hash' };
+
+    const userStr = params.get('user');
+    if (!userStr) return { ok: false, error: 'missing user' };
+    const user = JSON.parse(userStr);
+    return { ok: true, user };
+};
 
 const getGroupVerification = async (groupId, userId) => {
     const docId = getVerificationDocId(groupId, userId);
@@ -1258,6 +1297,20 @@ bot.action('settings_profile', async (ctx) => {
         ctx.editMessageText(`Profile:\nName: ${data.name}\nRegistered: ${data.registered_at.toDate().toLocaleDateString()}`);
     }
     ctx.answerCbQuery();
+});
+
+bot.on('message', async (ctx, next) => {
+    const wad = ctx.message?.web_app_data;
+    if (!wad?.data) return next();
+    try {
+        const payload = JSON.parse(wad.data);
+        const action = String(payload?.action || '').trim();
+        if (!action) return;
+        return await ctx.telegram.sendMessage(ctx.from.id, `/start ${action}`);
+    } catch (error) {
+        await reportError('web_app_data parse failed', error);
+        return;
+    }
 });
 
 // Handle feedback messages in private chat and active review sessions
@@ -2893,8 +2946,8 @@ app.get('/review/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const isWebhookMode = Boolean(SERVER_URL);
-const WEBHOOK_PATH = isWebhookMode ? `/webhook/${WEBHOOK_SECRET}` : null;
+const isWebhookMode = false;
+const WEBHOOK_PATH = null;
 
 app.listen(PORT, '0.0.0.0', () => console.log(`Web server listening on port ${PORT}`));
 
@@ -2905,21 +2958,9 @@ bot.catch(async (err, ctx) => {
 
 const startBot = async () => {
     try {
-        if (isWebhookMode) {
-            if (!WEBHOOK_SECRET) {
-                console.error('Missing required environment variable: WEBHOOK_SECRET');
-                process.exit(1);
-            }
-            const webhookUrl = `${SERVER_URL}${WEBHOOK_PATH}`;
-            console.log('Webhook mode enabled. Waiting for Telegram updates.');
-            app.use(bot.webhookCallback(WEBHOOK_PATH));
-            await bot.telegram.setWebhook(webhookUrl);
-            console.log(`Bot webhook configured at ${webhookUrl}`);
-        } else {
-            await bot.telegram.deleteWebhook();
-            await bot.launch();
-            console.log('Skillforge Bot launched in polling mode');
-        }
+        await bot.telegram.deleteWebhook();
+        await bot.launch();
+        console.log('Skillforge Bot launched in polling mode');
 
         await bot.telegram.setMyCommands([
             { command: 'start', description: 'Start the bot and show menu' },

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Skillforge Bot Menu</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
         * {
             margin: 0;
@@ -153,6 +154,14 @@
             margin-top: 30px;
         }
 
+        body:not(.is-staff) .staff-only {
+            display: none;
+        }
+
+        body.is-staff .public-only {
+            display: none;
+        }
+
         .emoji {
             font-size: 20px;
         }
@@ -180,68 +189,92 @@
             <div class="subtitle">Classroom Management System</div>
         </div>
 
+        <div class="menu-section public-only">
+            <div class="section-title">👤 Trainee / Public</div>
+            <div class="button-group full">
+                <button type="button" class="menu-btn btn-primary" data-action="menu">
+                    <span class="emoji">▶️</span> Open Bot Menu
+                </button>
+            </div>
+            <div class="button-group">
+                <button type="button" class="menu-btn btn-success" data-action="verify">
+                    <span class="emoji">✅</span> Verify
+                </button>
+                <button type="button" class="menu-btn btn-secondary" data-action="help">
+                    <span class="emoji">❓</span> Help
+                </button>
+            </div>
+            <div class="button-group full">
+                <button type="button" class="menu-btn btn-info" data-action="register">
+                    <span class="emoji">📝</span> Register as Staff
+                </button>
+            </div>
+        </div>
+
+        <div class="divider public-only"></div>
+
         <!-- Specialist Menu -->
-        <div class="menu-section">
+        <div class="menu-section staff-only">
             <div class="section-title">📋 Specialist Dashboard</div>
             <div class="button-group full">
-                <a href="https://t.me/skillforge_bot?start=menu" class="menu-btn btn-primary">
+                <button type="button" class="menu-btn btn-primary" data-action="menu">
                     <span class="emoji">▶️</span> Start/Menu
-                </a>
+                </button>
             </div>
             <div class="button-group">
-                <a href="https://t.me/skillforge_bot?start=register" class="menu-btn btn-success">
+                <button type="button" class="menu-btn btn-success" data-action="register">
                     <span class="emoji">📝</span> Register
-                </a>
-                <a href="https://t.me/skillforge_bot?start=claim" class="menu-btn btn-success">
+                </button>
+                <button type="button" class="menu-btn btn-success" data-action="claim">
                     <span class="emoji">🏢</span> Claim Group
-                </a>
+                </button>
             </div>
         </div>
 
         <div class="divider"></div>
 
-        <div class="menu-section">
+        <div class="menu-section staff-only">
             <div class="section-title">📅 Classroom Operations</div>
             <div class="button-group">
-                <a href="https://t.me/skillforge_bot?start=schedule" class="menu-btn btn-info">
+                <button type="button" class="menu-btn btn-info" data-action="schedule">
                     <span class="emoji">⏰</span> Schedule Class
-                </a>
-                <a href="https://t.me/skillforge_bot?start=classes" class="menu-btn btn-info">
+                </button>
+                <button type="button" class="menu-btn btn-info" data-action="classes">
                     <span class="emoji">📚</span> View Classes
-                </a>
+                </button>
             </div>
             <div class="button-group">
-                <a href="https://t.me/skillforge_bot?start=report" class="menu-btn btn-secondary">
+                <button type="button" class="menu-btn btn-secondary" data-action="report">
                     <span class="emoji">📊</span> Reports
-                </a>
-                <a href="https://t.me/skillforge_bot?start=progress" class="menu-btn btn-secondary">
+                </button>
+                <button type="button" class="menu-btn btn-secondary" data-action="progress">
                     <span class="emoji">📈</span> Progress
-                </a>
+                </button>
             </div>
         </div>
 
         <div class="divider"></div>
 
-        <div class="menu-section">
+        <div class="menu-section staff-only">
             <div class="section-title">🎯 Weekly Review</div>
             <div class="button-group full">
-                <a href="https://t.me/skillforge_bot?start=weekly" class="menu-btn btn-primary">
+                <button type="button" class="menu-btn btn-primary" data-action="weekly">
                     <span class="emoji">📝</span> Submit Weekly Report (Saturday)
-                </a>
+                </button>
             </div>
         </div>
 
         <div class="divider"></div>
 
-        <div class="menu-section">
+        <div class="menu-section staff-only">
             <div class="section-title">⚙️ Account</div>
             <div class="button-group">
-                <a href="https://t.me/skillforge_bot?start=settings" class="menu-btn btn-secondary">
+                <button type="button" class="menu-btn btn-secondary" data-action="settings">
                     <span class="emoji">⚙️</span> Settings
-                </a>
-                <a href="https://t.me/skillforge_bot?start=help" class="menu-btn btn-secondary">
+                </button>
+                <button type="button" class="menu-btn btn-secondary" data-action="help">
                     <span class="emoji">❓</span> Help
-                </a>
+                </button>
             </div>
         </div>
 
@@ -252,15 +285,40 @@
     </div>
     <script>
         (function () {
-            if (!window.Telegram || !window.Telegram.WebApp) return;
-            const tg = window.Telegram.WebApp;
-            try { tg.ready(); } catch (e) {}
-            document.querySelectorAll('a[href^="https://t.me/"]').forEach((a) => {
-                a.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    try { tg.openTelegramLink(a.href); } catch (err) { window.location.href = a.href; }
+            const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+            if (tg) {
+                try { tg.ready(); } catch (e) {}
+            }
+
+            async function loadRole() {
+                if (!tg || !tg.initData) return { ok: true, role: 'public' };
+                const res = await fetch('/api/webapp/role', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ initData: tg.initData })
                 });
+                return await res.json();
+            }
+
+            function sendAction(action) {
+                if (!tg) return;
+                tg.sendData(JSON.stringify({ action }));
+                tg.close();
+            }
+
+            document.addEventListener('click', (e) => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
+                e.preventDefault();
+                const action = btn.getAttribute('data-action');
+                sendAction(action);
             });
+
+            loadRole().then((r) => {
+                if (r && r.ok && r.role === 'specialist') {
+                    document.body.classList.add('is-staff');
+                }
+            }).catch(() => {});
         })();
     </script>
 </body>
