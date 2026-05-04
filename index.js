@@ -86,13 +86,24 @@ const getBotDirectMessageLink = () => `https://t.me/${BOT_USERNAME_SAFE}`;
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+{
+    const originalSendMessage = bot.telegram.sendMessage.bind(bot.telegram);
+    bot.telegram.sendMessage = (chatId, text, extra) => originalSendMessage(chatId, normalizeBotText(text), extra);
+}
+
 bot.use(async (ctx, next) => {
     try {
-        const text = ctx.message?.text;
-        if (text) {
-            console.log(`Incoming message: ${text} from ${ctx.from?.id || 'unknown'} chat=${ctx.chat?.id || 'unknown'}`);
-        } else if (ctx.updateType) {
-            console.log(`Incoming updateType=${ctx.updateType}`);
+        if (typeof ctx.reply === 'function') {
+            const originalReply = ctx.reply.bind(ctx);
+            ctx.reply = (text, extra) => originalReply(normalizeBotText(text), extra);
+        }
+        if (typeof ctx.editMessageText === 'function') {
+            const originalEdit = ctx.editMessageText.bind(ctx);
+            ctx.editMessageText = (text, extra) => originalEdit(normalizeBotText(text), extra);
+        }
+        if (typeof ctx.answerCbQuery === 'function') {
+            const originalAnswer = ctx.answerCbQuery.bind(ctx);
+            ctx.answerCbQuery = (text, extra) => originalAnswer(text == null ? text : normalizeBotText(text), extra);
         }
     } catch {}
     return next();
@@ -219,8 +230,35 @@ const randomCode = () => String(Math.floor(100000 + Math.random() * 900000));
 const hashCode = (code) => require('crypto').createHash('sha256').update(String(code)).digest('hex');
 const randomSessionId = () => require('crypto').randomBytes(24).toString('hex');
 
+const normalizeBotText = (text) => {
+    if (text == null) return text;
+    return String(text)
+        .replaceAll('â—ï¸', '❗️')
+        .replaceAll('âŒ', '❌')
+        .replaceAll('âœ…', '✅')
+        .replaceAll('âš ï¸', '⚠️')
+        .replaceAll('â³', '⏳')
+        .replaceAll('â›”', '🚫')
+        .replaceAll('â˜€ï¸', '☀️')
+        .replaceAll('ðŸš€', '🚀')
+        .replaceAll('ðŸ“Š', '📊')
+        .replaceAll('ðŸ“', '📝')
+        .replaceAll('ðŸ‘¥', '👥')
+        .replaceAll('â­', '⭐')
+        .replaceAll('â€¢', '•');
+};
+
+const escapeHtml = (text) => String(text ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+
+const buildUserMentionHtml = (userId, label) => `<a href="tg://user?id=${encodeURIComponent(String(userId))}">${escapeHtml(label)}</a>`;
+
 const reportError = async (message, error) => {
-    const fullMessage = `â—ï¸ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`;
+    const fullMessage = normalizeBotText(`❗️ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`);
     console.error(fullMessage);
     if (REPORT_CHAT_ID) {
         try {
@@ -480,7 +518,7 @@ bot.command('register', async (ctx) => {
             registered_at: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        ctx.reply(`âœ… Welcome to the team, Specialist ${specialistName}! \n\nYou are now authorized. Please go to your cohort's Telegram group, add me as an Admin, and type /claim to link the classroom.`);
+        ctx.reply(`✅ Welcome to the team, Specialist ${specialistName}!\n\nYou are now authorized. Please go to your cohort's Telegram group, add me as an Admin, and type /claim to link the classroom.`);
     } catch (error) {
         console.log("Register Error:", error);
         ctx.reply("âŒ An error occurred during registration.");
@@ -566,46 +604,46 @@ bot.command('help', (ctx) => {
             return ctx.reply(helpText, { parse_mode: 'Markdown' });
         }
 
-        const helpText = `*Skillforge Bot Commands*
+            const helpText = `*Skillforge Bot Commands*
 
 ` +
-            `â€¢ /register <password> - Register as a Specialist.
+            `• /register <password> - Register as a Specialist.
 ` +
-            `â€¢ /claim - Claim your Telegram classroom group.
+            `• /claim - Claim your Telegram classroom group.
 ` +
-            `â€¢ /setclass <group_id> <HH:MM> [topic] - Schedule todayâ€™s live session with optional topic.
+            `• /setclass <group_id> <HH:MM> [topic] - Schedule today’s live session with optional topic.
 ` +
-            `â€¢ /rescheduleclass <group_id> <old_time> <new_time> - Move a session to a new time.
+            `• /rescheduleclass <group_id> <old_time> <new_time> - Move a session to a new time.
 ` +
-            `â€¢ /cancelclass <group_id> [time] - Cancel one or all todayâ€™s sessions.
+            `• /cancelclass <group_id> [time] - Cancel one or all today’s sessions.
 ` +
-            `â€¢ /classlist - Show all upcoming live sessions for your classrooms.
+            `• /classlist - Show all upcoming live sessions for your classrooms.
 ` +
-            `â€¢ /status - Show your classroom status and todayâ€™s schedule.
+            `• /status - Show your classroom status and today’s schedule.
 ` +
-            `â€¢ /health - Check bot health and system status.
+            `• /health - Check bot health and system status.
 ` +
-            `â€¢ /attended - Confirm attendance for the current session (in DM).
+            `• /attended - Confirm attendance for the current session (in DM).
 ` +
-            `â€¢ /missed - Report missing the current session (in DM).
+            `• /missed - Report missing the current session (in DM).
 ` +
-            `â€¢ /backup <group_name> - Assign yourself as backup specialist.
+            `• /backup <group_name> - Assign yourself as backup specialist.
 ` +
-            `â€¢ /calendar [date] - List classes for a date (YYYY-MM-DD).
+            `• /calendar [date] - List classes for a date (YYYY-MM-DD).
 ` +
-            `â€¢ /report [date] - Get attendance report for your classes.
+            `• /report [date] - Get attendance report for your classes.
 ` +
-            `â€¢ /weeklyreport - Generate weekly summary report (Saturdays only).
+            `• /weeklyreport - Generate weekly summary report (Saturdays only).
 ` +
-            `â€¢ /setprogram <group_id> <YYYY-MM-DD> - Define course first class date and tracking plan.
+            `• /setprogram <group_id> <YYYY-MM-DD> - Define course first class date and tracking plan.
 ` +
-            `â€¢ /courseprogress <group_id> - Show weekly performance meter and plan progress.
+            `• /courseprogress <group_id> - Show weekly performance meter and plan progress.
 ` +
-            `â€¢ /questionnaire - Download the staff questionnaire PDF.
+            `• /questionnaire - Download the staff questionnaire PDF.
 ` +
-            `â€¢ /verify - Verify your trainee account in private chat.
+            `• /verify - Verify your trainee account in private chat.
 ` +
-            `â€¢ /help - Show this message.`;
+            `• /help - Show this message.`;
         return ctx.reply(helpText, { parse_mode: 'Markdown' });
     }).catch(() => {
         ctx.reply('Use /help again.');
@@ -1643,7 +1681,7 @@ cron.schedule('0 8 * * *', async () => {
 
         for (const doc of classroomsSnapshot.docs) {
             const room = doc.data();
-            const message = `Good morning Specialist ${room.specialist_name}! â˜€ï¸\n\nWill there be a live session for **${room.group_name}** today?`;
+            const message = `Good morning Specialist ${room.specialist_name}! ☀️\n\nWill there be a live session for **${room.group_name}** today?`;
             try {
                 await bot.telegram.sendMessage(room.specialist_id, message, {
                     parse_mode: 'Markdown',
@@ -2088,8 +2126,8 @@ bot.on('new_chat_members', async (ctx) => {
             });
         }
 
-        await ctx.reply(`Welcome to Skillforge Digital! ðŸš€\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
-            Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))])
+        await ctx.reply(`Welcome to Skillforge Digital! 🚀\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
+            Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))])
         );
     } catch (error) {
         console.log("Could not send welcome message (Bot might have been kicked):", error.message);
@@ -2264,21 +2302,27 @@ bot.action(/^verify_select_(.+)$/, async (ctx) => {
     ctx.answerCbQuery();
 });
 
-bot.start(async (ctx) => {
+bot.command('start', async (ctx) => {
     try {
-        const payload = ctx.startPayload;
+        const messageText = String(ctx.message?.text || '');
+        const payloadText = messageText.replace(/^\/start(@\w+)?\s*/i, '').trim();
+        const payload = payloadText || null;
         const userId = ctx.from.id.toString();
         const normalizedPayload = payload === 'start' || payload === 'menu' ? null : payload;
-        console.log(`Start handler: user=${userId} payload=${normalizedPayload || ''}`);
 
         if (normalizedPayload === 'verify' || (normalizedPayload && normalizedPayload.startsWith('verify_'))) {
             const groupId = normalizedPayload && normalizedPayload.startsWith('verify_') ? decodeURIComponent(normalizedPayload.slice('verify_'.length)) : null;
             return await handleVerification(ctx, groupId);
         }
 
-        const roleInfo = await getUserRole(userId);
+        let roleInfo;
+        try {
+            roleInfo = await getUserRole(userId);
+        } catch (error) {
+            await reportError('getUserRole failed', error);
+            roleInfo = { role: 'trainee_unverified' };
+        }
         const isStaff = roleInfo.role === 'specialist';
-        console.log(`Start role resolved: user=${userId} role=${roleInfo.role}`);
 
         if (normalizedPayload === 'register') {
             return ctx.reply(`To register as a specialist, use:\n/register YOUR_PASSWORD\n\nIf you don't have the password, contact your head of units.`);
@@ -2531,11 +2575,32 @@ cron.schedule('0 */3 * * *', async () => {
                 continue;
             }
 
-            const message = `âš ï¸ **Verification Reminder** âš ï¸\n\nIf you have not verified yet, please verify now to access the classroom fully.`;
             try {
+                const unverifiedSnapshot = await db.collection('group_verifications')
+                    .where('group_id', '==', groupId)
+                    .where('verified', '==', false)
+                    .where('removed', '==', false)
+                    .get();
+
+                if (unverifiedSnapshot.empty) {
+                    await stopVerifyCampaign(groupId);
+                    continue;
+                }
+
+                const unverifiedUsers = unverifiedSnapshot.docs.map(d => d.data()).filter(Boolean);
+                const mentionLimit = 20;
+                const mentions = unverifiedUsers.slice(0, mentionLimit).map((u) => {
+                    const label = u.username ? `@${u.username}` : `user ${u.user_id}`;
+                    return buildUserMentionHtml(u.user_id, label);
+                }).join(' ');
+
+                const remaining = unverifiedUsers.length - Math.min(unverifiedUsers.length, mentionLimit);
+                const remainingLine = remaining > 0 ? `\n\nAnd ${remaining} more unverified member(s).` : '';
+                const message = `⚠️ <b>Verification Reminder</b>\n\n${mentions}${remainingLine}\n\nIf you have not verified yet, please verify now to access the classroom fully.`;
+
                 await bot.telegram.sendMessage(groupId, message, {
-                    parse_mode: 'Markdown',
-                    ...Markup.inlineKeyboard([Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))])
+                    parse_mode: 'HTML',
+                    ...Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))])
                 });
                 await updateVerifyReminderSent(groupId);
             } catch (error) {
