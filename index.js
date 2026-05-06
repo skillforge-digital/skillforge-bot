@@ -496,6 +496,264 @@ async function sendDmUsers(userIds, text, extra = {}) {
     }
 }
 
+const sendSpecialistGroupPicker = async (ctx, specialistId, title, callbackPrefix) => {
+    const groupsSnapshot = await db.collection('classrooms')
+        .where('specialist_id', '==', specialistId)
+        .get();
+
+    if (groupsSnapshot.empty) {
+        await ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+        return false;
+    }
+
+    if (groupsSnapshot.size === 1) {
+        const only = groupsSnapshot.docs[0];
+        return { groupId: only.id, groupName: only.data()?.group_name || only.id };
+    }
+
+    const buttons = [];
+    for (const doc of groupsSnapshot.docs.slice(0, 12)) {
+        const room = doc.data() || {};
+        const label = room.group_name || doc.id;
+        buttons.push([Markup.button.callback(label, `${callbackPrefix}_${doc.id}`)]);
+    }
+    await ctx.reply(title, Markup.inlineKeyboard(buttons));
+    return false;
+};
+
+const runAttendanceReport = async (ctx, dateStr) => {
+    if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
+
+    const userId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(userId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    const classesSnapshot = await db.collection('classes')
+        .where('specialist_id', '==', userId)
+        .where('date', '==', dateStr)
+        .get();
+
+    if (classesSnapshot.empty) {
+        return ctx.reply(`No classes found for ${dateStr}.`);
+    }
+
+    let response = `📊 **Attendance Report for ${dateStr}**\n\n`;
+    for (const doc of classesSnapshot.docs) {
+        const classData = doc.data();
+        const attendanceSnapshot = await db.collection('attendance')
+            .where('class_id', '==', doc.id)
+            .get();
+
+        const attended = attendanceSnapshot.docs.filter(d => d.data().attended).length;
+        const missed = attendanceSnapshot.docs.filter(d => !d.data().attended).length;
+        const total = attended + missed;
+
+        response += `**${classData.group_name}** at ${classData.time}:\n`;
+        response += `  Attended: ${attended}\n`;
+        response += `  Missed: ${missed}\n`;
+        response += `  Total: ${total}\n\n`;
+    }
+
+    return ctx.reply(response, { parse_mode: 'Markdown' });
+};
+
+const runWeeklyReport = async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
+
+    const userId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(userId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    const today = new Date();
+    if (today.getDay() !== 6) {
+        return ctx.reply('Weekly reports are only available on Saturdays.');
+    }
+
+    const lastMonday = new Date(today);
+    lastMonday.setDate(today.getDate() - today.getDay() - 6);
+    const lastSunday = new Date(lastMonday);
+    lastSunday.setDate(lastMonday.getDate() + 6);
+
+    const mondayStr = getLagosDateString(lastMonday);
+    const sundayStr = getLagosDateString(lastSunday);
+
+    const classesSnapshot = await db.collection('classes')
+        .where('specialist_id', '==', userId)
+        .where('date', '>=', mondayStr)
+        .where('date', '<=', sundayStr)
+        .get();
+
+    let totalScheduled = 0;
+    let totalHeld = 0;
+    let totalAttendance = 0;
+    let totalPossibleAttendance = 0;
+    let feedbackList = [];
+
+    for (const classDoc of classesSnapshot.docs) {
+        const classData = classDoc.data();
+        totalScheduled += 1;
+
+        const attendanceSnapshot = await db.collection('attendance')
+            .where('class_id', '==', classDoc.id)
+            .get();
+
+        if (!attendanceSnapshot.empty) {
+            totalHeld += 1;
+            const attendedCount = attendanceSnapshot.docs.filter(d => d.data().attended).length;
+            totalAttendance += attendedCount;
+            totalPossibleAttendance += attendanceSnapshot.size;
+        }
+
+        const feedbackSnapshot = await db.collection('feedback')
+            .where('class_id', '==', classDoc.id)
+            .get();
+
+        feedbackSnapshot.forEach(fb => {
+            feedbackList.push(fb.data().feedback);
+        });
+    }
+
+    const attendanceRate = totalPossibleAttendance > 0 ? ((totalAttendance / totalPossibleAttendance) * 100).toFixed(1) : 0;
+
+    let report = `📊 **Weekly Report for ${specialistDoc.data().name}**\n`;
+    report += `Period: ${mondayStr} to ${sundayStr}\n\n`;
+    report += `📅 **Class Statistics**\n`;
+    report += `• Classes Scheduled: ${totalScheduled}\n`;
+    report += `• Classes Held: ${totalHeld}\n`;
+    report += `• Classes Missed: ${totalScheduled - totalHeld}\n\n`;
+    report += `👥 **Attendance Overview**\n`;
+    report += `• Total Attendance: ${totalAttendance}/${totalPossibleAttendance}\n`;
+    report += `• Attendance Rate: ${attendanceRate}%\n\n`;
+    report += `🎯 **Program Tracking Note**\n`;
+    report += `• Target: 3 sessions per week, at least 2 unique class days, 45 minutes per session.\n`;
+    report += `• Use /courseprogress <group_id> for the course performance meter and detailed weekly status.\n\n`;
+
+    if (feedbackList.length > 0) {
+        report += `📝 **Feedback Summary**\n`;
+        report += `Total Feedback Received: ${feedbackList.length}\n\n`;
+        const ratings = feedbackList.filter(f => /\b[1-5]\b/.test(f)).map(f => parseInt(f.match(/\b[1-5]\b/)[0]));
+        if (ratings.length > 0) {
+            const avgRating = (ratings.reduce((a,b)=>a+b,0) / ratings.length).toFixed(1);
+            report += `Average Rating: ${avgRating}/5 ⭐\n\n`;
+        }
+        report += `Recent Comments:\n`;
+        feedbackList.slice(-5).forEach((fb, i) => {
+            report += `${i+1}. ${fb.length > 100 ? fb.substring(0,100)+'...' : fb}\n`;
+        });
+    } else {
+        report += `📝 No feedback received this week.\n`;
+    }
+
+    report += `\n--- End of Report ---\n`;
+    report += `Generated on: ${getLagosDateString()}`;
+
+    await ctx.reply(report, { parse_mode: 'Markdown' });
+    const reportBuffer = Buffer.from(report.replace(/\*/g, '').replace(/`/g, ''), 'utf-8');
+    return ctx.replyWithDocument({ source: reportBuffer, filename: `weekly_report_${mondayStr}_to_${sundayStr}.txt` });
+};
+
+const runCourseProgress = async (ctx, groupId) => {
+    if (ctx.chat.type !== 'private') return;
+    if (!(await requireSpecialist(ctx))) return;
+
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    if (!roomDoc.exists) {
+        return ctx.reply('That group is not linked to a classroom yet.');
+    }
+
+    const room = roomDoc.data();
+    const specialistId = ctx.from.id.toString();
+    if (room.specialist_id !== specialistId) {
+        return ctx.reply('You are not the linked specialist for that group.');
+    }
+
+    if (!room.course_start_date) {
+        return ctx.reply(`No course program is defined for **${room.group_name}**.\nPlease set the first class date with /setprogram ${groupId} YYYY-MM-DD.`);
+    }
+
+    const startDate = parseDateString(room.course_start_date);
+    const today = new Date();
+    const isStarted = today >= startDate;
+    const weeks = room.course_weeks || 3;
+    const sessionsPerWeek = room.sessions_per_week || 3;
+    const minDaysPerWeek = room.min_days_per_week || 2;
+
+    const daysSinceStart = isStarted ? Math.floor((today - startDate) / (1000 * 60 * 60 * 24)) : 0;
+    const weekIndex = isStarted ? Math.min(weeks, Math.floor(daysSinceStart / 7) + 1) : 0;
+    const statusLabel = isStarted ? `Started (Week ${weekIndex} of ${weeks})` : 'Not started yet';
+
+    const weekBounds = getWeekBounds(today);
+    const performance = await getWeekPerformance(groupId, weekBounds.monday, weekBounds.sunday, room);
+
+    let response = `📈 **Course Progress for ${room.group_name}**\n`;
+    response += `• Course start: ${room.course_start_date}\n`;
+    response += `• Course end: ${room.course_end_date}\n`;
+    response += `• Status: ${statusLabel}\n\n`;
+    response += `**Weekly Performance Meter**\n`;
+    response += `• Sessions held this week: ${performance.heldSessions}/${performance.expectedSessions}\n`;
+    response += `• Active class days this week: ${performance.classDays}/${performance.expectedDays}\n`;
+    response += `• Attendance rate: ${performance.attendanceRate}%\n`;
+    response += `• Performance meter: ${performance.meterValue}/100\n\n`;
+    response += `**Plan targets**\n`;
+    response += `• ${sessionsPerWeek} classes per week\n`;
+    response += `• Minimum ${minDaysPerWeek} class days per week\n`;
+    response += `• ${room.expected_duration_minutes || 45} minutes per session\n`;
+    response += `• Total planned sessions: ${room.expected_total_sessions || weeks * sessionsPerWeek}\n`;
+    response += isStarted
+        ? `\n✅ The course has officially started.`
+        : `\n⏳ The course has not started yet. First class is scheduled for ${room.course_start_date}.`;
+
+    return ctx.reply(response, { parse_mode: 'Markdown' });
+};
+
+const startWeeklyQuestionnaire = async (ctx, specialistId, groupId) => {
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    if (!roomDoc.exists) {
+        return ctx.reply('That group is not linked to a classroom.');
+    }
+
+    const room = roomDoc.data();
+    if (room.specialist_id !== specialistId) {
+        return ctx.reply('You are not the linked specialist for that group.');
+    }
+
+    const today = new Date();
+    const weekBounds = getWeekBounds(today);
+    const sessionRef = db.collection('questionnaire_sessions').doc();
+    const sessionId = sessionRef.id;
+
+    await sessionRef.set({
+        user_id: specialistId,
+        specialist_id: specialistId,
+        group_id: groupId,
+        group_name: room.group_name,
+        status: 'pending',
+        current_step: 0,
+        answers: [],
+        week_start: dateToString(weekBounds.monday),
+        week_end: dateToString(weekBounds.sunday),
+        course_weeks: room.course_weeks || 3,
+        sessions_per_week: room.sessions_per_week || 3,
+        min_days_per_week: room.min_days_per_week || 2,
+        expected_duration_minutes: room.expected_duration_minutes || 45,
+        expected_total_sessions: room.expected_total_sessions || 9,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const message = `📋 Weekly review ready for *${room.group_name}*\nPeriod: *${dateToString(weekBounds.monday)}* to *${dateToString(weekBounds.sunday)}*\n\nAre you ready to take your weekly review?`;
+    return ctx.reply(message, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([Markup.button.callback('Yes, start review', `review_start_${sessionId}`)])
+    });
+};
+
 // ==========================================
 // MODULE 1: SPECIALIST & CLASSROOM MANAGER
 // ==========================================
@@ -981,157 +1239,17 @@ bot.command('calendar', async (ctx) => {
 
 // Attendance Report for Specialists
 bot.command('report', async (ctx) => {
-    if (ctx.chat.type !== 'private') return;
-    if (!(await requireSpecialist(ctx))) return;
-
-    const userId = ctx.from.id.toString();
-    const specialistDoc = await db.collection('specialists').doc(userId).get();
-    if (!specialistDoc.exists) {
-        return ctx.reply('You are not a registered specialist.');
-    }
-
     const args = ctx.message.text.split(' ').slice(1);
     let dateStr = getLagosDateString();
     if (args.length > 0) {
         dateStr = args[0];
     }
-
-    const classesSnapshot = await db.collection('classes')
-        .where('specialist_id', '==', userId)
-        .where('date', '==', dateStr)
-        .get();
-
-    if (classesSnapshot.empty) {
-        return ctx.reply(`No classes found for ${dateStr}.`);
-    }
-
-    let response = `ðŸ“Š **Attendance Report for ${dateStr}**\n\n`;
-    for (const doc of classesSnapshot.docs) {
-        const classData = doc.data();
-        const attendanceSnapshot = await db.collection('attendance')
-            .where('class_id', '==', doc.id)
-            .get();
-
-        const attended = attendanceSnapshot.docs.filter(d => d.data().attended).length;
-        const missed = attendanceSnapshot.docs.filter(d => !d.data().attended).length;
-        const total = attended + missed;
-
-        response += `**${classData.group_name}** at ${classData.time}:\n`;
-        response += `  Attended: ${attended}\n`;
-        response += `  Missed: ${missed}\n`;
-        response += `  Total: ${total}\n\n`;
-    }
-
-    ctx.reply(response, { parse_mode: 'Markdown' });
+    return await runAttendanceReport(ctx, dateStr);
 });
 
 // Weekly Report for Specialists (Available on Saturdays)
 bot.command('weeklyreport', async (ctx) => {
-    if (ctx.chat.type !== 'private') return;
-    if (!(await requireSpecialist(ctx))) return;
-
-    const userId = ctx.from.id.toString();
-    const specialistDoc = await db.collection('specialists').doc(userId).get();
-    if (!specialistDoc.exists) {
-        return ctx.reply('You are not a registered specialist.');
-    }
-
-    // Check if today is Saturday
-    const today = new Date();
-    if (today.getDay() !== 6) { // 0=Sunday, 6=Saturday
-        return ctx.reply('Weekly reports are only available on Saturdays.');
-    }
-
-    // Calculate last week: Monday to Sunday
-    const lastMonday = new Date(today);
-    lastMonday.setDate(today.getDate() - today.getDay() - 6); // Go back to last Monday
-    const lastSunday = new Date(lastMonday);
-    lastSunday.setDate(lastMonday.getDate() + 6);
-
-    const mondayStr = getLagosDateString(lastMonday);
-    const sundayStr = getLagosDateString(lastSunday);
-
-    // Get all classes for the specialist in the past week
-    const classesSnapshot = await db.collection('classes')
-        .where('specialist_id', '==', userId)
-        .where('date', '>=', mondayStr)
-        .where('date', '<=', sundayStr)
-        .get();
-
-    let totalScheduled = 0;
-    let totalHeld = 0;
-    let totalAttendance = 0;
-    let totalPossibleAttendance = 0;
-    let feedbackList = [];
-
-    for (const classDoc of classesSnapshot.docs) {
-        const classData = classDoc.data();
-        totalScheduled += 1;
-
-        // Check if class was held (has attendance records)
-        const attendanceSnapshot = await db.collection('attendance')
-            .where('class_id', '==', classDoc.id)
-            .get();
-
-        if (!attendanceSnapshot.empty) {
-            totalHeld += 1;
-            const attendedCount = attendanceSnapshot.docs.filter(d => d.data().attended).length;
-            totalAttendance += attendedCount;
-            totalPossibleAttendance += attendanceSnapshot.size;
-        }
-
-        // Get feedback
-        const feedbackSnapshot = await db.collection('feedback')
-            .where('class_id', '==', classDoc.id)
-            .get();
-
-        feedbackSnapshot.forEach(fb => {
-            feedbackList.push(fb.data().feedback);
-        });
-    }
-
-    const attendanceRate = totalPossibleAttendance > 0 ? ((totalAttendance / totalPossibleAttendance) * 100).toFixed(1) : 0;
-
-    // Generate report
-    let report = `ðŸ“Š **Weekly Report for ${specialistDoc.data().name}**\n`;
-    report += `Period: ${mondayStr} to ${sundayStr}\n\n`;
-    report += `ðŸ“… **Class Statistics**\n`;
-    report += `â€¢ Classes Scheduled: ${totalScheduled}\n`;
-    report += `â€¢ Classes Held: ${totalHeld}\n`;
-    report += `â€¢ Classes Missed: ${totalScheduled - totalHeld}\n\n`;
-    report += `ðŸ‘¥ **Attendance Overview**\n`;
-    report += `â€¢ Total Attendance: ${totalAttendance}/${totalPossibleAttendance}\n`;
-    report += `â€¢ Attendance Rate: ${attendanceRate}%\n\n`;
-    report += `ðŸŽ¯ **Program Tracking Note**\n`;
-    report += `â€¢ Target: 3 sessions per week, at least 2 unique class days, 45 minutes per session.\n`;
-    report += `â€¢ Use /courseprogress <group_id> for the course performance meter and detailed weekly status.\n\n`;
-
-    if (feedbackList.length > 0) {
-        report += `ðŸ“ **Feedback Summary**\n`;
-        report += `Total Feedback Received: ${feedbackList.length}\n\n`;
-        // Simple sentiment analysis (count ratings)
-        const ratings = feedbackList.filter(f => /\b[1-5]\b/.test(f)).map(f => parseInt(f.match(/\b[1-5]\b/)[0]));
-        if (ratings.length > 0) {
-            const avgRating = (ratings.reduce((a,b)=>a+b,0) / ratings.length).toFixed(1);
-            report += `Average Rating: ${avgRating}/5 â­\n\n`;
-        }
-        report += `Recent Comments:\n`;
-        feedbackList.slice(-5).forEach((fb, i) => {
-            report += `${i+1}. ${fb.length > 100 ? fb.substring(0,100)+'...' : fb}\n`;
-        });
-    } else {
-        report += `ðŸ“ No feedback received this week.\n`;
-    }
-
-    report += `\n--- End of Report ---\n`;
-    report += `Generated on: ${getLagosDateString()}`;
-
-    // Send as message (for "download", user can copy-paste)
-    ctx.reply(report, { parse_mode: 'Markdown' });
-
-    // Optional: Send as file
-    const reportBuffer = Buffer.from(report.replace(/\*/g, '').replace(/`/g, ''), 'utf-8');
-    await ctx.replyWithDocument({ source: reportBuffer, filename: `weekly_report_${mondayStr}_to_${sundayStr}.txt` });
+    return await runWeeklyReport(ctx);
 });
 
 bot.command('setprogram', async (ctx) => {
@@ -1190,53 +1308,7 @@ bot.command('courseprogress', async (ctx) => {
     }
 
     const groupId = args[0];
-    const roomDoc = await db.collection('classrooms').doc(groupId).get();
-    if (!roomDoc.exists) {
-        return ctx.reply('That group is not linked to a classroom yet.');
-    }
-
-    const room = roomDoc.data();
-    if (!room.course_start_date) {
-        return ctx.reply(`No course program is defined for **${room.group_name}**.\nPlease set the first class date with /setprogram ${groupId} YYYY-MM-DD.`);
-    }
-
-    const startDate = parseDateString(room.course_start_date);
-    const endDate = parseDateString(room.course_end_date);
-    const today = new Date();
-    const isStarted = today >= startDate;
-    const weeks = room.course_weeks || 3;
-    const sessionsPerWeek = room.sessions_per_week || 3;
-    const minDaysPerWeek = room.min_days_per_week || 2;
-
-    const daysSinceStart = isStarted ? Math.floor((today - startDate) / (1000 * 60 * 60 * 24)) : 0;
-    const weekIndex = isStarted ? Math.min(weeks, Math.floor(daysSinceStart / 7) + 1) : 0;
-    const statusLabel = isStarted ? `Started (Week ${weekIndex} of ${weeks})` : 'Not started yet';
-
-    const weekBounds = getWeekBounds(today);
-    const performance = await getWeekPerformance(groupId, weekBounds.monday, weekBounds.sunday, room);
-
-    let response = `ðŸ“ˆ **Course Progress for ${room.group_name}**\n`;
-    response += `â€¢ Course start: ${room.course_start_date}\n`;
-    response += `â€¢ Course end: ${room.course_end_date}\n`;
-    response += `â€¢ Status: ${statusLabel}\n\n`;
-    response += `**Weekly Performance Meter**\n`;
-    response += `â€¢ Sessions held this week: ${performance.heldSessions}/${performance.expectedSessions}\n`;
-    response += `â€¢ Active class days this week: ${performance.classDays}/${performance.expectedDays}\n`;
-    response += `â€¢ Attendance rate: ${performance.attendanceRate}%\n`;
-    response += `â€¢ Performance meter: ${performance.meterValue}/100\n\n`;
-    response += `**Plan targets**\n`;
-    response += `â€¢ ${sessionsPerWeek} classes per week\n`;
-    response += `â€¢ Minimum ${minDaysPerWeek} class days per week\n`;
-    response += `â€¢ ${room.expected_duration_minutes || 45} minutes per session\n`;
-    response += `â€¢ Total planned sessions: ${room.expected_total_sessions || weeks * sessionsPerWeek}\n`;
-
-    if (isStarted) {
-        response += `\nâœ… The course has officially started.`;
-    } else {
-        response += `\nâ³ The course has not started yet. First class is scheduled for ${room.course_start_date}.`;
-    }
-
-    ctx.reply(response, { parse_mode: 'Markdown' });
+    return await runCourseProgress(ctx, groupId);
 });
 
 bot.command('questionnaire', async (ctx) => {
@@ -1314,21 +1386,89 @@ bot.command('questionnaire', async (ctx) => {
     });
 });
 
+bot.action(/^review_start_(.+)$/, async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') return ctx.answerCbQuery();
+        if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
+
+        const specialistId = ctx.from.id.toString();
+        const sessionId = ctx.match[1];
+        const sessionRef = db.collection('questionnaire_sessions').doc(sessionId);
+        const sessionDoc = await sessionRef.get();
+        if (!sessionDoc.exists) {
+            await ctx.reply('I could not find that review session. Please start again with /questionnaire.');
+            return ctx.answerCbQuery();
+        }
+
+        const session = sessionDoc.data();
+        if (String(session.user_id || session.specialist_id || '') !== specialistId) {
+            await ctx.reply('This review session does not belong to you.');
+            return ctx.answerCbQuery();
+        }
+
+        if (session.status === 'completed') {
+            await ctx.reply('This weekly review is already completed.');
+            return ctx.answerCbQuery();
+        }
+
+        await sessionRef.set({
+            status: 'in_progress',
+            current_step: session.current_step ?? 0,
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        await ctx.reply(`Question 1 of ${REVIEW_QUESTIONS.length}: ${REVIEW_QUESTIONS[0]}`);
+        return ctx.answerCbQuery();
+    } catch (error) {
+        await reportError('review_start failed', error);
+        try {
+            await ctx.reply('❌ Unable to start the review right now. Please try again.');
+        } catch {}
+        return ctx.answerCbQuery();
+    }
+});
+
 bot.action('report_weekly', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
-    ctx.editMessageText('Generating weekly report...');
+    try {
+        await runWeeklyReport(ctx);
+    } catch (error) {
+        await reportError('report_weekly action failed', error);
+        try {
+            await ctx.reply('❌ Unable to generate weekly report right now. Please try /weeklyreport.');
+        } catch {}
+    }
     ctx.answerCbQuery();
 });
 
 bot.action('report_attendance', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
-    ctx.editMessageText('Generating attendance report...');
+    try {
+        const dateStr = getLagosDateString();
+        await runAttendanceReport(ctx, dateStr);
+    } catch (error) {
+        await reportError('report_attendance action failed', error);
+        try {
+            await ctx.reply('❌ Unable to generate attendance report right now. Please try /report.');
+        } catch {}
+    }
     ctx.answerCbQuery();
 });
 
 bot.action('report_progress', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
-    ctx.editMessageText('Generating course progress report...');
+    try {
+        const specialistId = ctx.from.id.toString();
+        const picked = await sendSpecialistGroupPicker(ctx, specialistId, 'Select a group to view course progress:', 'courseprogress_pick');
+        if (picked) {
+            await runCourseProgress(ctx, picked.groupId);
+        }
+    } catch (error) {
+        await reportError('report_progress action failed', error);
+        try {
+            await ctx.reply('❌ Unable to fetch course progress right now. Please try /courseprogress <group_id>.');
+        } catch {}
+    }
     ctx.answerCbQuery();
 });
 
@@ -1349,7 +1489,79 @@ bot.action('settings_profile', async (ctx) => {
     ctx.answerCbQuery();
 });
 
+bot.action(/^daily_live_(yes|no)_(\d{4}-\d{2}-\d{2})$/, async (ctx) => {
+    const answer = ctx.match[1];
+    const dateStr = ctx.match[2];
+    const specialistId = ctx.from.id.toString();
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (!specialistDoc.exists) return ctx.answerCbQuery();
+
+    await db.collection('daily_live_session_confirmations').doc(`${specialistId}_${dateStr}`).set({
+        specialist_id: specialistId,
+        date: dateStr,
+        answer,
+        answered_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+
+    if (answer === 'no') {
+        await ctx.reply(`Noted. If you schedule a class later today, reminders will still run automatically.`);
+        return ctx.answerCbQuery();
+    }
+
+    const classesSnapshot = await db.collection('classes')
+        .where('specialist_id', '==', specialistId)
+        .where('date', '==', dateStr)
+        .where('status', '==', 'active')
+        .get();
+
+    if (classesSnapshot.empty) {
+        await ctx.reply(`I couldn't find any live sessions scheduled for today (${dateStr}).`);
+        return ctx.answerCbQuery();
+    }
+
+    let summary = `Today's live sessions (${dateStr}):\n`;
+    for (const classDoc of classesSnapshot.docs) {
+        const classData = classDoc.data();
+        const topic = classData.topic ? ` - ${classData.topic}` : '';
+        summary += `\n• ${classData.group_name} at ${classData.time}${topic}`;
+    }
+    await ctx.reply(summary);
+    return ctx.answerCbQuery();
+});
+
 bot.on('message', async (ctx, next) => {
+    try {
+        const chatType = ctx.chat?.type;
+        if (chatType && (chatType === 'group' || chatType === 'supergroup')) {
+            const entities = ctx.message?.entities || [];
+            const isCommand = entities.some((e) => e.type === 'bot_command' && e.offset === 0);
+            if (isCommand) {
+                const groupId = ctx.chat.id.toString();
+                const userId = ctx.from?.id ? ctx.from.id.toString() : null;
+                if (userId && !ctx.from.is_bot) {
+                    const specialistDoc = await db.collection('specialists').doc(userId).get();
+                    if (!specialistDoc.exists) {
+                        const existing = await getGroupVerification(groupId, userId);
+                        if (!existing) {
+                            await setGroupVerification(groupId, userId, {
+                                group_id: groupId,
+                                user_id: userId,
+                                username: ctx.from?.username || ctx.from?.first_name || null,
+                                joined_at: admin.firestore.FieldValue.serverTimestamp(),
+                                verified: false,
+                                verified_at: null,
+                                timed_out: false,
+                                timed_out_at: null,
+                                removed: false,
+                                removed_at: null
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    } catch {}
+
     const wad = ctx.message?.web_app_data;
     if (!wad?.data) return next();
     try {
@@ -1551,9 +1763,11 @@ bot.action('submit_report', async (ctx) => {
     if (today.getDay() !== 6) {
         return ctx.answerCbQuery('Reports can only be submitted on Saturdays!');
     }
-    ctx.reply('📝 Starting weekly report. Use /weeklyreport or click the button below:', 
+    ctx.reply(
+        'Choose a report type:',
         Markup.inlineKeyboard([
-            [Markup.button.callback('Start Report Now', 'start_report')]
+            [Markup.button.callback('📊 Weekly Stats Report', 'report_weekly')],
+            [Markup.button.callback('📝 Weekly Review Questionnaire', 'start_report')]
         ])
     );
     ctx.answerCbQuery();
@@ -1561,7 +1775,45 @@ bot.action('submit_report', async (ctx) => {
 
 bot.action('start_report', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
-    ctx.reply('📊 Weekly Report started. Please answer the questions...');
+    try {
+        const specialistId = ctx.from.id.toString();
+        const picked = await sendSpecialistGroupPicker(ctx, specialistId, 'Select a group to start the weekly review questionnaire:', 'questionnaire_pick');
+        if (picked) {
+            await startWeeklyQuestionnaire(ctx, specialistId, picked.groupId);
+        }
+    } catch (error) {
+        await reportError('start_report action failed', error);
+        try {
+            await ctx.reply('❌ Unable to start weekly review right now. Please try /questionnaire.');
+        } catch {}
+    }
+    ctx.answerCbQuery();
+});
+
+bot.action(/^courseprogress_pick_(.+)$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    try {
+        await runCourseProgress(ctx, groupId);
+    } catch (error) {
+        await reportError('courseprogress_pick failed', error);
+        try {
+            await ctx.reply('❌ Unable to fetch course progress right now.');
+        } catch {}
+    }
+    ctx.answerCbQuery();
+});
+
+bot.action(/^questionnaire_pick_(.+)$/, async (ctx) => {
+    const groupId = ctx.match[1];
+    const specialistId = ctx.from.id.toString();
+    try {
+        await startWeeklyQuestionnaire(ctx, specialistId, groupId);
+    } catch (error) {
+        await reportError('questionnaire_pick failed', error);
+        try {
+            await ctx.reply('❌ Unable to start weekly review right now.');
+        } catch {}
+    }
     ctx.answerCbQuery();
 });
 
@@ -2058,24 +2310,14 @@ cron.schedule('30 7 * * *', async () => {
 
         for (const specialistDoc of specialistsSnapshot.docs) {
             const specialistId = specialistDoc.id;
-            const classesSnapshot = await db.collection('classes')
-                .where('specialist_id', '==', specialistId)
-                .where('date', '==', todayStr)
-                .where('status', '==', 'active')
-                .get();
-
-            let summary = `*Daily Live Session Summary*\nToday: ${todayStr}\n`;
-            if (classesSnapshot.empty) {
-                summary += '\nNo live sessions are scheduled for today.';
-            } else {
-                for (const classDoc of classesSnapshot.docs) {
-                    const classData = classDoc.data();
-                    const topic = classData.topic ? ` - ${classData.topic}` : '';
-                    summary += `\nâ€¢ ${classData.group_name} at *${classData.time}*${topic}`;
-                }
-            }
-
-            await sendDmUsers([specialistId], summary, { parse_mode: 'Markdown' });
+            await bot.telegram.sendMessage(
+                specialistId,
+                `Good morning. Do you have any live session scheduled for today (${todayStr})?`,
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('Yes', `daily_live_yes_${todayStr}`)],
+                    [Markup.button.callback('No', `daily_live_no_${todayStr}`)]
+                ])
+            );
         }
     } catch (error) {
         await reportError('Daily summary job failed', error);
@@ -2112,10 +2354,12 @@ bot.on('new_chat_members', async (ctx) => {
 
         for (const member of newMembers) {
             if (member.is_bot) continue;
-            await setGroupVerification(groupId, member.id.toString(), {
+            const userId = member.id.toString();
+            const usernameOrName = member.username || member.first_name || null;
+            await setGroupVerification(groupId, userId, {
                 group_id: groupId,
-                user_id: member.id.toString(),
-                username: member.username || member.first_name || null,
+                user_id: userId,
+                username: usernameOrName,
                 joined_at: admin.firestore.FieldValue.serverTimestamp(),
                 verified: false,
                 verified_at: null,
@@ -2126,9 +2370,8 @@ bot.on('new_chat_members', async (ctx) => {
             });
         }
 
-        await ctx.reply(`Welcome to Skillforge Digital! 🚀\n\nTo ensure a safe environment, please verify your account within 24 hours or you will be timed out.`,
-            Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))])
-        );
+        const message = `Welcome to Skillforge Digital.\n\nTo receive class reminders in private messages, you must verify by messaging the bot.\n\nTap Verify Now, then press Start (or send /verify in private chat).`;
+        await ctx.telegram.sendMessage(groupId, message, Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))]));
     } catch (error) {
         console.log("Could not send welcome message (Bot might have been kicked):", error.message);
     }
@@ -2146,9 +2389,9 @@ bot.on('my_chat_member', async (ctx) => {
 
         const groupId = chat.id.toString();
         await startVerifyCampaign(groupId);
-        const message = `✅ Verification Required\n\nPlease verify your account to access the classroom fully.\n\nTap the button below to verify:`;
+        const message = `✅ Verification Required\n\nTo receive class reminders in private messages, trainees must verify.\n\nTap the button below to verify:`;
         await ctx.telegram.sendMessage(groupId, message, Markup.inlineKeyboard([
-            [Markup.button.url('Verify Now âœ…', getVerifyLink(groupId))]
+            [Markup.button.url('Verify Now ✅', getVerifyLink(groupId))]
         ]));
     } catch (error) {
         await reportError('my_chat_member handler failed', error);
@@ -2157,7 +2400,32 @@ bot.on('my_chat_member', async (ctx) => {
 
 const handleVerification = async (ctx, groupIdHint = null) => {
     if (ctx.chat.type !== 'private') {
-        return ctx.reply('Please verify in a private chat with the bot.');
+        const groupId = ctx.chat?.id ? String(ctx.chat.id) : null;
+        const link = groupId ? getVerifyLink(groupId) : getBotDirectMessageLink();
+        try {
+            const userId = ctx.from?.id ? String(ctx.from.id) : null;
+            if (groupId && userId) {
+                const specialistDoc = await db.collection('specialists').doc(userId).get();
+                if (!specialistDoc.exists) {
+                    const existing = await getGroupVerification(groupId, userId);
+                    if (!existing) {
+                        await setGroupVerification(groupId, userId, {
+                            group_id: groupId,
+                            user_id: userId,
+                            username: ctx.from?.username || ctx.from?.first_name || null,
+                            joined_at: admin.firestore.FieldValue.serverTimestamp(),
+                            verified: false,
+                            verified_at: null,
+                            timed_out: false,
+                            timed_out_at: null,
+                            removed: false,
+                            removed_at: null
+                        });
+                    }
+                }
+            }
+        } catch {}
+        return ctx.reply('Please verify in a private chat with the bot:', Markup.inlineKeyboard([Markup.button.url('Open Private Chat ✅', link)]));
     }
 
     const userId = ctx.from.id.toString();
@@ -2201,7 +2469,7 @@ const handleVerification = async (ctx, groupIdHint = null) => {
     const finalizeVerification = async (groupId) => {
         const existing = await getGroupVerification(groupId, userId);
         if (existing?.verified) {
-            return ctx.reply('You are already verified! 🎓');
+            return ctx.reply('You are already verified! 🎓 Thank you.');
         }
 
         if (!existing) {
@@ -2234,7 +2502,14 @@ const handleVerification = async (ctx, groupIdHint = null) => {
             console.log('Permission restore error:', error.message);
         }
 
-        return ctx.reply('Verification successful! ✅ You now have full access.');
+        try {
+            const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name || `user ${userId}`);
+            await ctx.telegram.sendMessage(groupId, `✅ ${buildUserMentionHtml(userId, label)} verified successfully. Thank you.`, { parse_mode: 'HTML' });
+        } catch (error) {
+            console.log('Verification thank-you error:', error.message);
+        }
+
+        return ctx.reply('Verification successful! ✅ Thank you. You now have full access.');
     };
 
     if (groupIdHint) {
@@ -2309,6 +2584,32 @@ bot.command('start', async (ctx) => {
         const payload = payloadText || null;
         const userId = ctx.from.id.toString();
         const normalizedPayload = payload === 'start' || payload === 'menu' ? null : payload;
+
+        if (ctx.chat.type !== 'private') {
+            const groupId = ctx.chat?.id ? String(ctx.chat.id) : null;
+            const link = groupId ? getVerifyLink(groupId) : getBotDirectMessageLink();
+            try {
+                const specialistDoc = await db.collection('specialists').doc(userId).get();
+                if (!specialistDoc.exists && groupId) {
+                    const existing = await getGroupVerification(groupId, userId);
+                    if (!existing) {
+                        await setGroupVerification(groupId, userId, {
+                            group_id: groupId,
+                            user_id: userId,
+                            username: ctx.from?.username || ctx.from?.first_name || null,
+                            joined_at: admin.firestore.FieldValue.serverTimestamp(),
+                            verified: false,
+                            verified_at: null,
+                            timed_out: false,
+                            timed_out_at: null,
+                            removed: false,
+                            removed_at: null
+                        });
+                    }
+                }
+            } catch {}
+            return ctx.reply('Please verify in a private chat with the bot:', Markup.inlineKeyboard([Markup.button.url('Open Private Chat ✅', link)]));
+        }
 
         if (normalizedPayload === 'verify' || (normalizedPayload && normalizedPayload.startsWith('verify_'))) {
             const groupId = normalizedPayload && normalizedPayload.startsWith('verify_') ? decodeURIComponent(normalizedPayload.slice('verify_'.length)) : null;
@@ -2459,19 +2760,44 @@ bot.hears('Submit Weekly Report', async (ctx) => {
         return ctx.reply(listResponse + '\nUse /questionnaire <group_id> to proceed.');
     }
 
-    // Start the questionnaire for the group
-    const sessionId = `${specialistId}_${groupId}_${Date.now()}`;
-    await db.collection('questionnaire_sessions').doc(sessionId).set({
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    if (!roomDoc.exists) {
+        return ctx.reply('That group is not linked to a classroom.');
+    }
+
+    const room = roomDoc.data();
+    if (room.specialist_id !== specialistId) {
+        return ctx.reply('You are not the linked specialist for that group.');
+    }
+
+    const weekBounds = getWeekBounds(today);
+    const sessionRef = db.collection('questionnaire_sessions').doc();
+    const sessionId = sessionRef.id;
+
+    await sessionRef.set({
+        user_id: specialistId,
         specialist_id: specialistId,
         group_id: groupId,
-        current_question: 0,
-        answers: {},
-        started_at: admin.firestore.FieldValue.serverTimestamp()
+        group_name: room.group_name,
+        status: 'pending',
+        current_step: 0,
+        answers: [],
+        week_start: dateToString(weekBounds.monday),
+        week_end: dateToString(weekBounds.sunday),
+        course_weeks: room.course_weeks || 3,
+        sessions_per_week: room.sessions_per_week || 3,
+        min_days_per_week: room.min_days_per_week || 2,
+        expected_duration_minutes: room.expected_duration_minutes || 45,
+        expected_total_sessions: room.expected_total_sessions || 9,
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    ctx.reply('Starting weekly questionnaire...', Markup.inlineKeyboard([
-        Markup.button.callback('Start Review', `review_start_${sessionId}`)
-    ]));
+    const message = `📋 Weekly review ready for *${room.group_name}*\nPeriod: *${dateToString(weekBounds.monday)}* to *${dateToString(weekBounds.sunday)}*\n\nAre you ready to take your weekly review?`;
+    return ctx.reply(message, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([Markup.button.callback('Yes, start review', `review_start_${sessionId}`)])
+    });
 });
 
 bot.hears('Schedule Class', async (ctx) => {
@@ -2596,7 +2922,7 @@ cron.schedule('0 */3 * * *', async () => {
 
                 const remaining = unverifiedUsers.length - Math.min(unverifiedUsers.length, mentionLimit);
                 const remainingLine = remaining > 0 ? `\n\nAnd ${remaining} more unverified member(s).` : '';
-                const message = `⚠️ <b>Verification Reminder</b>\n\n${mentions}${remainingLine}\n\nIf you have not verified yet, please verify now to access the classroom fully.`;
+                const message = `⚠️ <b>Verification Reminder</b>\n\n${mentions}${remainingLine}\n\nIf you have not verified yet, please verify now to receive class reminders in DM.\n\nIf you are not tagged here, send /verify in this group or message the bot privately with /verify.`;
 
                 await bot.telegram.sendMessage(groupId, message, {
                     parse_mode: 'HTML',
