@@ -3491,6 +3491,47 @@ const startBot = async () => {
             throw error;
         }
 
+        const BOT_COMMANDS_FULL = [
+            { command: 'start', description: 'Start the bot and show menu' },
+            { command: 'register', description: 'Register as a Specialist (staff only)' },
+            { command: 'claim', description: 'Link a group as your classroom' },
+            { command: 'setclass', description: 'Schedule a live session' },
+            { command: 'cancelclass', description: 'Cancel scheduled sessions' },
+            { command: 'rescheduleclass', description: 'Change session time' },
+            { command: 'status', description: 'View daily status and schedule' },
+            { command: 'classlist', description: 'List upcoming sessions' },
+            { command: 'health', description: 'Check bot health' },
+            { command: 'attended', description: 'Mark attendance (trainees)' },
+            { command: 'missed', description: 'Report absence (trainees)' },
+            { command: 'calendar', description: 'View classes on a date' },
+            { command: 'report', description: 'Get attendance report' },
+            { command: 'weeklyreport', description: 'Generate weekly summary' },
+            { command: 'courseprogress', description: 'View course performance' },
+            { command: 'questionnaire', description: 'Start weekly review' },
+            { command: 'verify', description: 'Verify trainee account' },
+            { command: 'help', description: 'Show help menu' }
+        ];
+
+        const BOT_COMMANDS_GROUP = [
+            { command: 'start', description: 'Start the bot' },
+            { command: 'verify', description: 'Verify in DM (get reminders)' },
+            { command: 'claim', description: 'Link this group (staff only)' },
+            { command: 'status', description: 'View group status' },
+            { command: 'help', description: 'Show help' }
+        ];
+
+        const syncBotCommands = async () => {
+            try {
+                await bot.telegram.setMyCommands(BOT_COMMANDS_FULL);
+                await bot.telegram.setMyCommands(BOT_COMMANDS_FULL, { scope: { type: 'all_private_chats' } });
+                await bot.telegram.setMyCommands(BOT_COMMANDS_GROUP, { scope: { type: 'all_group_chats' } });
+            } catch (error) {
+                console.error('setMyCommands failed:', error?.message || error);
+            }
+        };
+
+        await syncBotCommands();
+
         if (isWebhookMode) {
             botRuntime.polling.state = 'webhook';
             const webhookUrl = `${SERVER_URL}${WEBHOOK_PATH}`;
@@ -3541,27 +3582,6 @@ const startBot = async () => {
             }
         }
         if (!botRuntime.launched) return;
-
-        await bot.telegram.setMyCommands([
-            { command: 'start', description: 'Start the bot and show menu' },
-            { command: 'register', description: 'Register as a Specialist (staff only)' },
-            { command: 'claim', description: 'Link a group as your classroom' },
-            { command: 'setclass', description: 'Schedule a live session' },
-            { command: 'cancelclass', description: 'Cancel scheduled sessions' },
-            { command: 'rescheduleclass', description: 'Change session time' },
-            { command: 'status', description: 'View daily status and schedule' },
-            { command: 'classlist', description: 'List upcoming sessions' },
-            { command: 'health', description: 'Check bot health' },
-            { command: 'attended', description: 'Mark attendance (trainees)' },
-            { command: 'missed', description: 'Report absence (trainees)' },
-            { command: 'calendar', description: 'View classes on a date' },
-            { command: 'report', description: 'Get attendance report' },
-            { command: 'weeklyreport', description: 'Generate weekly summary' },
-            { command: 'courseprogress', description: 'View course performance' },
-            { command: 'questionnaire', description: 'Start weekly review' },
-            { command: 'verify', description: 'Verify trainee account' },
-            { command: 'help', description: 'Show help menu' }
-        ]);
 
         console.log('Skillforge Bot is fully operational!');
     } catch (error) {
