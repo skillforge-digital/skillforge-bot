@@ -1576,14 +1576,14 @@ bot.on('message', async (ctx, next) => {
 });
 
 // Handle feedback messages in private chat and active review sessions
-bot.on('text', async (ctx) => {
-    if (ctx.chat.type !== 'private') return;
+bot.on('text', async (ctx, next) => {
+    if (ctx.chat.type !== 'private') return next();
 
     const userId = ctx.from.id.toString();
     const messageText = ctx.message.text;
 
     if (!messageText || messageText.startsWith('/')) {
-        return;
+        return next();
     }
 
     const activeSessionSnapshot = await db.collection('questionnaire_sessions')
@@ -1702,7 +1702,7 @@ bot.on('text', async (ctx) => {
             .where('verified', '==', true)
             .where('removed', '==', false)
             .get();
-        if (verifiedGroupsSnapshot.empty) return;
+        if (verifiedGroupsSnapshot.empty) return next();
 
         let bestClass = null;
         for (const membershipDoc of verifiedGroupsSnapshot.docs) {
@@ -1733,8 +1733,11 @@ bot.on('text', async (ctx) => {
                 timestamp: admin.firestore.FieldValue.serverTimestamp()
             });
             ctx.reply('âœ… Thank you for your feedback!');
+            return;
         }
     }
+
+    return next();
 });
 
 // Morning Class Check (Runs every day at 8:00 AM Lagos Time)
