@@ -51,6 +51,12 @@ const REPORT_LOGOTAG = process.env.REPORT_LOGOTAG || 'Skillforge Principal Bot';
 const CLASS_TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const EXCLUDED_SYSTEM_USER_IDS = new Set(['1087968824', '777000']);
 const EXCLUDED_SYSTEM_USERNAMES = new Set(['groupanonymousbot', 'telegram']);
+const SUPER_ADMIN_IDS = new Set(
+    String(process.env.SUPER_ADMIN_IDS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+);
 
 const serveMenuHtml = (res) => {
     const menuPath = path.join(__dirname, 'public', 'menu.html');
@@ -202,6 +208,8 @@ const requireSpecialist = async (ctx) => {
     }
     return true;
 };
+
+const isSuperAdminId = (userId) => SUPER_ADMIN_IDS.has(String(userId));
 
 const requireGroupManager = async (ctx, groupId) => {
     const uid = ctx.from?.id ? String(ctx.from.id) : null;
@@ -3431,7 +3439,7 @@ app.post('/admin/auth/request', async (req, res) => {
         const telegram_id = String(req.body?.telegram_id || '').trim();
         if (!telegram_id) return res.status(400).json({ error: 'telegram_id required' });
         const specialistDoc = await db.collection('specialists').doc(telegram_id).get();
-        if (!specialistDoc.exists) return res.status(403).json({ error: 'not a specialist' });
+        if (!specialistDoc.exists && !isSuperAdminId(telegram_id)) return res.status(403).json({ error: 'not allowed' });
 
         const code = randomCode();
         const expiresAt = admin.firestore.Timestamp.fromDate(new Date(Date.now() + 10 * 60 * 1000));
@@ -3473,10 +3481,11 @@ app.post('/admin/auth/verify', async (req, res) => {
 
         const sessionId = randomSessionId();
         const sessionExpires = admin.firestore.Timestamp.fromDate(new Date(Date.now() + 12 * 60 * 60 * 1000));
+        const role = isSuperAdminId(telegram_id) ? 'super_admin' : 'specialist';
         await db.collection('admin_sessions').doc(sessionId).set({
             session_id: sessionId,
             telegram_id,
-            role: 'specialist',
+            role,
             created_at: admin.firestore.FieldValue.serverTimestamp(),
             expires_at: sessionExpires
         });
