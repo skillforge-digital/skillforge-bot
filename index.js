@@ -6,6 +6,9 @@ const PDFDocument = require('pdfkit');
 const admin = require('firebase-admin');
 const cron = require('node-cron');
 const express = require('express');
+const { createSequentialLimiter, withTelegramRetry } = require('./lib/telegramLimiter');
+const { adjustGroupCounters, computeCountersFromVerificationDocs } = require('./lib/groupCounters');
+const { isGroupAdmin, setGroupAdmin, removeGroupAdmin, listGroupAdmins } = require('./lib/groupAdmins');
 
 // ==========================================
 // SETUP & CONNECTIONS
@@ -90,7 +93,16 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 {
     const originalSendMessage = bot.telegram.sendMessage.bind(bot.telegram);
-    bot.telegram.sendMessage = (chatId, text, extra) => originalSendMessage(chatId, normalizeBotText(text), extra);
+    const telegramLimiter = createSequentialLimiter();
+    bot.telegram.sendMessage = (chatId, text, extra) => telegramLimiter(() => withTelegramRetry(() => originalSendMessage(chatId, normalizeBotText(text), extra)));
+    if (typeof bot.telegram.restrictChatMember === 'function') {
+        const originalRestrict = bot.telegram.restrictChatMember.bind(bot.telegram);
+        bot.telegram.restrictChatMember = (chatId, userId, extra) => telegramLimiter(() => withTelegramRetry(() => originalRestrict(chatId, userId, extra)));
+    }
+    if (typeof bot.telegram.kickChatMember === 'function') {
+        const originalKick = bot.telegram.kickChatMember.bind(bot.telegram);
+        bot.telegram.kickChatMember = (chatId, userId, extra) => telegramLimiter(() => withTelegramRetry(() => originalKick(chatId, userId, extra)));
+    }
 }
 
 bot.use(async (ctx, next) => {
@@ -186,6 +198,18 @@ const requireSpecialist = async (ctx) => {
     const ok = await isSpecialist(uid);
     if (!ok) {
         await ctx.reply('Staff only.');
+        return false;
+    }
+    return true;
+};
+
+const requireGroupManager = async (ctx, groupId) => {
+    const uid = ctx.from?.id ? String(ctx.from.id) : null;
+    if (!uid) return false;
+    if (await isSpecialist(uid)) return true;
+    const ok = await isGroupAdmin(db, String(groupId), uid);
+    if (!ok) {
+        await ctx.reply('Admins only.');
         return false;
     }
     return true;
@@ -913,6 +937,14 @@ bot.command('help', (ctx) => {
 ` +
             `• /roster - View trainee roster for your classrooms.
 ` +
+            `• /recount <group_id> - Recalculate verification counters for one group.
+` +
+            `• /addadmin <group_id> <user_id> - Add a stored group admin.
+` +
+            `• /removeadmin <group_id> <user_id> - Remove a stored group admin.
+` +
+            `• /listadmins <group_id> - List stored group admins.
+` +
             `• /health - Check bot health and system status.
 ` +
             `• /attended - Confirm attendance for the current session (in DM).
@@ -944,8 +976,8 @@ bot.command('help', (ctx) => {
 
 bot.command('status', async (ctx) => {
     try {
-        if (!(await requireSpecialist(ctx))) return;
         if (ctx.chat.type === 'private') {
+            if (!(await requireSpecialist(ctx))) return;
             const specialistId = ctx.from.id.toString();
             const specialistDoc = await db.collection('specialists').doc(specialistId).get();
             if (!specialistDoc.exists) {
@@ -975,19 +1007,27 @@ bot.command('status', async (ctx) => {
             const groupIds = groupsSnapshot.docs.map(d => String(d.id)).filter(Boolean);
             let pendingCount = 0;
             for (const gid of groupIds) {
-                const pendingSnapshot = await db.collection('group_verifications')
-                    .where('group_id', '==', gid)
-                    .where('verified', '==', false)
-                    .where('timed_out', '==', false)
-                    .where('removed', '==', false)
-                    .get();
-                pendingCount += pendingSnapshot.size;
+                const settingsDoc = await db.collection('group_settings').doc(gid).get();
+                const settings = settingsDoc.exists ? settingsDoc.data() : null;
+                const stored = settings && settings.counters_initialized === true && Number.isFinite(Number(settings.pending_count)) ? Number(settings.pending_count) : null;
+                if (stored != null) {
+                    pendingCount += stored;
+                } else {
+                    const pendingSnapshot = await db.collection('group_verifications')
+                        .where('group_id', '==', gid)
+                        .where('verified', '==', false)
+                        .where('timed_out', '==', false)
+                        .where('removed', '==', false)
+                        .get();
+                    pendingCount += pendingSnapshot.size;
+                }
             }
             response += `\n\nPending verifications in your groups: *${pendingCount}*`;
             return ctx.reply(response, { parse_mode: 'Markdown' });
         }
 
         const groupId = ctx.chat.id.toString();
+        if (!(await requireGroupManager(ctx, groupId))) return;
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) {
             return ctx.reply("This group has not been claimed yet.");
@@ -1010,13 +1050,20 @@ bot.command('status', async (ctx) => {
             }
         }
 
-        const pendingSnapshot = await db.collection('group_verifications')
-            .where('group_id', '==', groupId)
-            .where('verified', '==', false)
-            .where('timed_out', '==', false)
-            .where('removed', '==', false)
-            .get();
-        response += `\n\nPending verifications: *${pendingSnapshot.size}*`;
+        const settingsDoc = await db.collection('group_settings').doc(groupId).get();
+        const settings = settingsDoc.exists ? settingsDoc.data() : null;
+        const stored = settings && settings.counters_initialized === true && Number.isFinite(Number(settings.pending_count)) ? Number(settings.pending_count) : null;
+        if (stored != null) {
+            response += `\n\nPending verifications: *${stored}*`;
+        } else {
+            const pendingSnapshot = await db.collection('group_verifications')
+                .where('group_id', '==', groupId)
+                .where('verified', '==', false)
+                .where('timed_out', '==', false)
+                .where('removed', '==', false)
+                .get();
+            response += `\n\nPending verifications: *${pendingSnapshot.size}*`;
+        }
         ctx.reply(response, { parse_mode: 'Markdown' });
     } catch (error) {
         await reportError('Status command failed', error);
@@ -2403,18 +2450,39 @@ bot.on('new_chat_members', async (ctx) => {
             const userId = member.id.toString();
             const profile = getUserProfileFields(member);
             await upsertUserProfile(member);
-            await setGroupVerification(groupId, userId, {
-                group_id: groupId,
-                user_id: userId,
-                ...profile,
-                joined_at: admin.firestore.FieldValue.serverTimestamp(),
-                verified: false,
-                verified_at: null,
-                timed_out: false,
-                timed_out_at: null,
-                removed: false,
-                removed_at: null
-            });
+            const existing = await getGroupVerification(groupId, userId);
+            if (!existing) {
+                await setGroupVerification(groupId, userId, {
+                    group_id: groupId,
+                    user_id: userId,
+                    ...profile,
+                    joined_at: admin.firestore.FieldValue.serverTimestamp(),
+                    verified: false,
+                    verified_at: null,
+                    timed_out: false,
+                    timed_out_at: null,
+                    removed: false,
+                    removed_at: null
+                });
+                await adjustGroupCounters(db, groupId, { unverified_count: 1, pending_count: 1 });
+            } else if (existing.removed) {
+                const wasVerified = Boolean(existing.verified);
+                await setGroupVerification(groupId, userId, {
+                    ...profile,
+                    joined_at: admin.firestore.FieldValue.serverTimestamp(),
+                    removed: false,
+                    removed_at: null,
+                    timed_out: false,
+                    timed_out_at: null
+                });
+                if (wasVerified) {
+                    await adjustGroupCounters(db, groupId, { verified_count: 1 });
+                } else {
+                    await adjustGroupCounters(db, groupId, { unverified_count: 1, pending_count: 1 });
+                }
+            } else {
+                await setGroupVerification(groupId, userId, { ...profile, removed: false, removed_at: null });
+            }
         }
 
         const message = `Welcome to Skillforge Digital.\n\nTo receive class reminders in private messages, you must verify by messaging the bot.\n\nTap Verify Now, then press Start (or send /verify in private chat).`;
@@ -2439,6 +2507,16 @@ bot.on('chat_member', async (ctx) => {
         await upsertUserProfile(user);
 
         if (status === 'left' || status === 'kicked') {
+            const existing = await getGroupVerification(groupId, userId);
+            if (existing && !existing.removed) {
+                if (Boolean(existing.verified)) {
+                    await adjustGroupCounters(db, groupId, { verified_count: -1 });
+                } else {
+                    const pendingDelta = existing.timed_out ? 0 : -1;
+                    const timedOutDelta = existing.timed_out ? -1 : 0;
+                    await adjustGroupCounters(db, groupId, { unverified_count: -1, pending_count: pendingDelta, timed_out_count: timedOutDelta });
+                }
+            }
             await setGroupVerification(groupId, userId, {
                 ...profile,
                 removed: true,
@@ -2508,6 +2586,7 @@ const handleVerification = async (ctx, groupIdHint = null) => {
                             removed: false,
                             removed_at: null
                         });
+                        await adjustGroupCounters(db, groupId, { unverified_count: 1, pending_count: 1 });
                     }
                 }
             }
@@ -2574,6 +2653,14 @@ const handleVerification = async (ctx, groupIdHint = null) => {
                 removed: false,
                 removed_at: null
             });
+        }
+
+        if (!existing) {
+            await adjustGroupCounters(db, groupId, { verified_count: 1 });
+        } else if (!existing.verified && !existing.removed) {
+            const pendingDelta = existing.timed_out ? 0 : -1;
+            const timedOutDelta = existing.timed_out ? -1 : 0;
+            await adjustGroupCounters(db, groupId, { verified_count: 1, unverified_count: -1, pending_count: pendingDelta, timed_out_count: timedOutDelta });
         }
 
         await setGroupVerification(groupId, userId, {
@@ -2730,6 +2817,118 @@ bot.action(/^roster_(.+)$/, async (ctx) => {
     }
 });
 
+bot.command('recount', async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /recount in a private chat with the bot.');
+        }
+        const ok = await requireSpecialist(ctx);
+        if (!ok) return;
+        const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
+        const groupId = parts[1] ? String(parts[1]) : null;
+        if (!groupId) return ctx.reply('Usage: /recount <group_id>');
+
+        const specialistId = String(ctx.from.id);
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) return ctx.reply('Group not found.');
+        const room = roomDoc.data() || {};
+        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
+
+        const snap = await db.collection('group_verifications').where('group_id', '==', groupId).get();
+        const docs = snap.docs.map((d) => d.data()).filter(Boolean);
+        const counters = computeCountersFromVerificationDocs(docs);
+        await db.collection('group_settings').doc(groupId).set({
+            group_id: groupId,
+            ...counters,
+            counters_initialized: true,
+            counters_recalculated_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        return ctx.reply(`Counters updated for ${room.group_name || groupId}.`);
+    } catch (error) {
+        await reportError('recount command failed', error);
+        return ctx.reply('Unable to recount right now.');
+    }
+});
+
+bot.command('addadmin', async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /addadmin in a private chat with the bot.');
+        }
+        const ok = await requireSpecialist(ctx);
+        if (!ok) return;
+        const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
+        const groupId = parts[1] ? String(parts[1]) : null;
+        const targetId = parts[2] ? String(parts[2]) : null;
+        if (!groupId || !targetId) return ctx.reply('Usage: /addadmin <group_id> <user_id>');
+        const specialistId = String(ctx.from.id);
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) return ctx.reply('Group not found.');
+        const room = roomDoc.data() || {};
+        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
+
+        await setGroupAdmin(db, groupId, targetId, {
+            added_by: specialistId,
+            added_at: admin.firestore.FieldValue.serverTimestamp()
+        });
+        return ctx.reply('Admin added.');
+    } catch (error) {
+        await reportError('addadmin command failed', error);
+        return ctx.reply('Unable to add admin right now.');
+    }
+});
+
+bot.command('removeadmin', async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /removeadmin in a private chat with the bot.');
+        }
+        const ok = await requireSpecialist(ctx);
+        if (!ok) return;
+        const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
+        const groupId = parts[1] ? String(parts[1]) : null;
+        const targetId = parts[2] ? String(parts[2]) : null;
+        if (!groupId || !targetId) return ctx.reply('Usage: /removeadmin <group_id> <user_id>');
+        const specialistId = String(ctx.from.id);
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) return ctx.reply('Group not found.');
+        const room = roomDoc.data() || {};
+        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
+
+        await removeGroupAdmin(db, groupId, targetId);
+        return ctx.reply('Admin removed.');
+    } catch (error) {
+        await reportError('removeadmin command failed', error);
+        return ctx.reply('Unable to remove admin right now.');
+    }
+});
+
+bot.command('listadmins', async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /listadmins in a private chat with the bot.');
+        }
+        const ok = await requireSpecialist(ctx);
+        if (!ok) return;
+        const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
+        const groupId = parts[1] ? String(parts[1]) : null;
+        if (!groupId) return ctx.reply('Usage: /listadmins <group_id>');
+        const specialistId = String(ctx.from.id);
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) return ctx.reply('Group not found.');
+        const room = roomDoc.data() || {};
+        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
+
+        const admins = await listGroupAdmins(db, groupId, 80);
+        if (!admins.length) return ctx.reply('No stored admins for this group.');
+        const lines = admins.map((a) => `• ${a.user_id}`).join('\n');
+        return ctx.reply(`Admins for ${room.group_name || groupId}:\n${lines}`);
+    } catch (error) {
+        await reportError('listadmins command failed', error);
+        return ctx.reply('Unable to list admins right now.');
+    }
+});
+
 bot.command('verify', async (ctx) => {
     try {
         await handleVerification(ctx);
@@ -2780,6 +2979,7 @@ bot.command('start', async (ctx) => {
                             removed: false,
                             removed_at: null
                         });
+                        await adjustGroupCounters(db, groupId, { unverified_count: 1, pending_count: 1 });
                     }
                 }
             } catch {}
@@ -3135,6 +3335,7 @@ cron.schedule('*/30 * * * *', async () => {
                         timed_out: true,
                         timed_out_at: admin.firestore.FieldValue.serverTimestamp()
                     });
+                    await adjustGroupCounters(db, data.group_id, { pending_count: -1, timed_out_count: 1 });
                     const displayName = data.username ? `@${data.username}` : (data.display_name || `${data.user_id}`);
                     const message = `â³ ${displayName} has been timed out for failing to verify within 24 hours.`;
                     await bot.telegram.sendMessage(data.group_id, message, Markup.inlineKeyboard([Markup.button.url('Verify to Restore Access ðŸ”“', getVerifyLink(data.group_id))]));
@@ -3159,6 +3360,7 @@ cron.schedule('*/30 * * * *', async () => {
                 try {
                     await bot.telegram.kickChatMember(data.group_id, data.user_id);
                     await db.collection('group_verifications').doc(doc.id).update({ removed: true, removed_at: admin.firestore.FieldValue.serverTimestamp() });
+                    await adjustGroupCounters(db, data.group_id, { unverified_count: -1, timed_out_count: -1 });
                     const displayName = data.username ? `@${data.username}` : (data.display_name || `${data.user_id}`);
                     const message = `â›” ${displayName} has been removed for failing to verify after timeout.`;
                     await bot.telegram.sendMessage(data.group_id, message);
