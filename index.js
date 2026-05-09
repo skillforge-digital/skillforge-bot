@@ -46,6 +46,8 @@ const SUPER_ADMIN_KEY = process.env.SUPER_ADMIN_KEY || null;
 const REPORT_LOGO_PATH = process.env.REPORT_LOGO_PATH || './logo.jpg';
 const REPORT_LOGOTAG = process.env.REPORT_LOGOTAG || 'Skillforge Principal Bot';
 const CLASS_TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const EXCLUDED_SYSTEM_USER_IDS = new Set(['1087968824', '777000']);
+const EXCLUDED_SYSTEM_USERNAMES = new Set(['groupanonymousbot', 'telegram']);
 
 const serveMenuHtml = (res) => {
     const menuPath = path.join(__dirname, 'public', 'menu.html');
@@ -256,6 +258,36 @@ const escapeHtml = (text) => String(text ?? '')
     .replaceAll("'", '&#39;');
 
 const buildUserMentionHtml = (userId, label) => `<a href="tg://user?id=${encodeURIComponent(String(userId))}">${escapeHtml(label)}</a>`;
+
+const shouldTrackUser = (user) => {
+    if (!user) return false;
+    if (user.is_bot) return false;
+    const id = user.id == null ? '' : String(user.id);
+    if (EXCLUDED_SYSTEM_USER_IDS.has(id)) return false;
+    const uname = user.username ? String(user.username).toLowerCase() : '';
+    if (uname && EXCLUDED_SYSTEM_USERNAMES.has(uname)) return false;
+    return true;
+};
+
+const getUserProfileFields = (user) => {
+    const username = user?.username ? String(user.username) : null;
+    const first_name = user?.first_name ? String(user.first_name) : null;
+    const last_name = user?.last_name ? String(user.last_name) : null;
+    const display_name = first_name ? (last_name ? `${first_name} ${last_name}` : first_name) : (username ? username : null);
+    return { username, first_name, last_name, display_name, is_bot: Boolean(user?.is_bot) };
+};
+
+const upsertUserProfile = async (user) => {
+    if (!user?.id) return;
+    const userId = String(user.id);
+    if (EXCLUDED_SYSTEM_USER_IDS.has(userId)) return;
+    const profile = getUserProfileFields(user);
+    await db.collection('users').doc(userId).set({
+        user_id: userId,
+        ...profile,
+        last_seen_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+};
 
 const reportError = async (message, error) => {
     const fullMessage = normalizeBotText(`❗️ Bot error: ${message}${error ? `\n${error.message || error}` : ''}`);
@@ -879,6 +911,8 @@ bot.command('help', (ctx) => {
 ` +
             `• /status - Show your classroom status and today’s schedule.
 ` +
+            `• /roster - View trainee roster for your classrooms.
+` +
             `• /health - Check bot health and system status.
 ` +
             `• /attended - Confirm attendance for the current session (in DM).
@@ -935,12 +969,21 @@ bot.command('status', async (ctx) => {
                 }
             }
 
-            const pendingSnapshot = await db.collection('group_verifications')
-                .where('verified', '==', false)
-                .where('timed_out', '==', false)
-                .where('removed', '==', false)
+            const groupsSnapshot = await db.collection('classrooms')
+                .where('specialist_id', '==', specialistId)
                 .get();
-            response += `\n\nPending verifications in all groups: *${pendingSnapshot.size}*`;
+            const groupIds = groupsSnapshot.docs.map(d => String(d.id)).filter(Boolean);
+            let pendingCount = 0;
+            for (const gid of groupIds) {
+                const pendingSnapshot = await db.collection('group_verifications')
+                    .where('group_id', '==', gid)
+                    .where('verified', '==', false)
+                    .where('timed_out', '==', false)
+                    .where('removed', '==', false)
+                    .get();
+                pendingCount += pendingSnapshot.size;
+            }
+            response += `\n\nPending verifications in your groups: *${pendingCount}*`;
             return ctx.reply(response, { parse_mode: 'Markdown' });
         }
 
@@ -2356,13 +2399,14 @@ bot.on('new_chat_members', async (ctx) => {
         const groupId = ctx.chat.id.toString();
 
         for (const member of newMembers) {
-            if (member.is_bot) continue;
+            if (!shouldTrackUser(member)) continue;
             const userId = member.id.toString();
-            const usernameOrName = member.username || member.first_name || null;
+            const profile = getUserProfileFields(member);
+            await upsertUserProfile(member);
             await setGroupVerification(groupId, userId, {
                 group_id: groupId,
                 user_id: userId,
-                username: usernameOrName,
+                ...profile,
                 joined_at: admin.firestore.FieldValue.serverTimestamp(),
                 verified: false,
                 verified_at: null,
@@ -2377,6 +2421,43 @@ bot.on('new_chat_members', async (ctx) => {
         await ctx.telegram.sendMessage(groupId, message, Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))]));
     } catch (error) {
         console.log("Could not send welcome message (Bot might have been kicked):", error.message);
+    }
+});
+
+bot.on('chat_member', async (ctx) => {
+    try {
+        const update = ctx.update?.chat_member;
+        const chat = update?.chat;
+        if (!chat || !['group', 'supergroup'].includes(chat.type)) return;
+        const groupId = String(chat.id);
+        const member = update?.new_chat_member;
+        const user = member?.user;
+        if (!shouldTrackUser(user)) return;
+        const userId = String(user.id);
+        const status = member?.status ? String(member.status) : '';
+        const profile = getUserProfileFields(user);
+        await upsertUserProfile(user);
+
+        if (status === 'left' || status === 'kicked') {
+            await setGroupVerification(groupId, userId, {
+                ...profile,
+                removed: true,
+                removed_at: admin.firestore.FieldValue.serverTimestamp()
+            });
+            return;
+        }
+
+        if (status) {
+            await setGroupVerification(groupId, userId, {
+                group_id: groupId,
+                user_id: userId,
+                ...profile,
+                removed: false,
+                removed_at: null
+            });
+        }
+    } catch (error) {
+        await reportError('chat_member handler failed', error);
     }
 });
 
@@ -2406,16 +2487,19 @@ const handleVerification = async (ctx, groupIdHint = null) => {
         const groupId = ctx.chat?.id ? String(ctx.chat.id) : null;
         const link = groupId ? getVerifyLink(groupId) : getBotDirectMessageLink();
         try {
-            const userId = ctx.from?.id ? String(ctx.from.id) : null;
-            if (groupId && userId) {
+            const fromUser = ctx.from;
+            const userId = fromUser?.id ? String(fromUser.id) : null;
+            if (groupId && userId && shouldTrackUser(fromUser)) {
                 const specialistDoc = await db.collection('specialists').doc(userId).get();
                 if (!specialistDoc.exists) {
                     const existing = await getGroupVerification(groupId, userId);
                     if (!existing) {
+                        const profile = getUserProfileFields(fromUser);
+                        await upsertUserProfile(fromUser);
                         await setGroupVerification(groupId, userId, {
                             group_id: groupId,
                             user_id: userId,
-                            username: ctx.from?.username || ctx.from?.first_name || null,
+                            ...profile,
                             joined_at: admin.firestore.FieldValue.serverTimestamp(),
                             verified: false,
                             verified_at: null,
@@ -2476,10 +2560,12 @@ const handleVerification = async (ctx, groupIdHint = null) => {
         }
 
         if (!existing) {
+            const profile = getUserProfileFields(ctx.from);
+            await upsertUserProfile(ctx.from);
             await setGroupVerification(groupId, userId, {
                 group_id: String(groupId),
                 user_id: userId,
-                username: ctx.from?.username || ctx.from?.first_name || null,
+                ...profile,
                 joined_at: admin.firestore.FieldValue.serverTimestamp(),
                 verified: false,
                 verified_at: null,
@@ -2506,7 +2592,7 @@ const handleVerification = async (ctx, groupIdHint = null) => {
         }
 
         try {
-            const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name || `user ${userId}`);
+            const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : `user ${userId}`);
             await ctx.telegram.sendMessage(groupId, `✅ ${buildUserMentionHtml(userId, label)} verified successfully. Thank you.`, { parse_mode: 'HTML' });
         } catch (error) {
             console.log('Verification thank-you error:', error.message);
@@ -2560,6 +2646,90 @@ const sendScheduleGroupPicker = async (ctx, specialistId) => {
     return ctx.reply(response, Markup.inlineKeyboard(buttons));
 };
 
+const sendRosterGroupPicker = async (ctx, specialistId) => {
+    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
+    if (!specialistDoc.exists) {
+        return ctx.reply('You are not a registered specialist.');
+    }
+
+    const groupsSnapshot = await db.collection('classrooms')
+        .where('specialist_id', '==', specialistId)
+        .get();
+
+    if (groupsSnapshot.empty) {
+        return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+    }
+
+    const buttons = [];
+    groupsSnapshot.docs.forEach(doc => {
+        const room = doc.data();
+        buttons.push([Markup.button.callback(`${room.group_name || doc.id}`, `roster_${doc.id}`)]);
+    });
+
+    return ctx.reply('Select a group to view trainee roster:', Markup.inlineKeyboard(buttons));
+};
+
+bot.command('roster', async (ctx) => {
+    if (ctx.chat.type !== 'private') {
+        return ctx.reply('Please use /roster in a private chat with the bot.');
+    }
+    const ok = await requireSpecialist(ctx);
+    if (!ok) return;
+    return await sendRosterGroupPicker(ctx, String(ctx.from.id));
+});
+
+bot.action(/^roster_(.+)$/, async (ctx) => {
+    try {
+        const ok = await requireSpecialist(ctx);
+        if (!ok) return;
+        const specialistId = String(ctx.from.id);
+        const groupId = String(ctx.match[1]);
+
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('Group not found.');
+            return;
+        }
+        const room = roomDoc.data() || {};
+        if (String(room.specialist_id || '') !== specialistId) {
+            await ctx.reply('You do not have access to this group roster.');
+            return;
+        }
+
+        const verifiedSnapshot = await db.collection('group_verifications')
+            .where('group_id', '==', groupId)
+            .where('verified', '==', true)
+            .where('removed', '==', false)
+            .get();
+        const unverifiedSnapshot = await db.collection('group_verifications')
+            .where('group_id', '==', groupId)
+            .where('verified', '==', false)
+            .where('removed', '==', false)
+            .get();
+
+        const unverifiedUsers = unverifiedSnapshot.docs
+            .map(d => d.data())
+            .filter((u) => u && !u.is_bot && !EXCLUDED_SYSTEM_USER_IDS.has(String(u.user_id)));
+
+        const mentionLimit = 30;
+        const mentions = unverifiedUsers.slice(0, mentionLimit).map((u) => {
+            const label = u.username ? `@${u.username}` : (u.display_name || `user ${u.user_id}`);
+            return buildUserMentionHtml(u.user_id, label);
+        }).join('\n');
+
+        const remaining = unverifiedUsers.length - Math.min(unverifiedUsers.length, mentionLimit);
+        const remainingLine = remaining > 0 ? `\n...and ${remaining} more.` : '';
+        const header = `<b>${escapeHtml(room.group_name || groupId)}</b>\nVerified: ${verifiedSnapshot.size}\nUnverified: ${unverifiedUsers.length}\n\n`;
+        const body = unverifiedUsers.length ? `Unverified trainees:\n${mentions}${remainingLine}` : 'No unverified trainees found.';
+        await ctx.reply(`${header}${body}`, { parse_mode: 'HTML' });
+    } catch (error) {
+        await reportError('roster action failed', error);
+        await ctx.reply('Unable to load roster right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
 bot.command('verify', async (ctx) => {
     try {
         await handleVerification(ctx);
@@ -2593,13 +2763,15 @@ bot.command('start', async (ctx) => {
             const link = groupId ? getVerifyLink(groupId) : getBotDirectMessageLink();
             try {
                 const specialistDoc = await db.collection('specialists').doc(userId).get();
-                if (!specialistDoc.exists && groupId) {
+                if (!specialistDoc.exists && groupId && shouldTrackUser(ctx.from)) {
                     const existing = await getGroupVerification(groupId, userId);
                     if (!existing) {
+                        const profile = getUserProfileFields(ctx.from);
+                        await upsertUserProfile(ctx.from);
                         await setGroupVerification(groupId, userId, {
                             group_id: groupId,
                             user_id: userId,
-                            username: ctx.from?.username || ctx.from?.first_name || null,
+                            ...profile,
                             joined_at: admin.firestore.FieldValue.serverTimestamp(),
                             verified: false,
                             verified_at: null,
@@ -2916,10 +3088,12 @@ cron.schedule('0 */3 * * *', async () => {
                     continue;
                 }
 
-                const unverifiedUsers = unverifiedSnapshot.docs.map(d => d.data()).filter(Boolean);
+                const unverifiedUsers = unverifiedSnapshot.docs
+                    .map(d => d.data())
+                    .filter((u) => u && !u.is_bot && !EXCLUDED_SYSTEM_USER_IDS.has(String(u.user_id)));
                 const mentionLimit = 20;
                 const mentions = unverifiedUsers.slice(0, mentionLimit).map((u) => {
-                    const label = u.username ? `@${u.username}` : `user ${u.user_id}`;
+                    const label = u.username ? `@${u.username}` : (u.display_name || `user ${u.user_id}`);
                     return buildUserMentionHtml(u.user_id, label);
                 }).join(' ');
 
@@ -2961,7 +3135,7 @@ cron.schedule('*/30 * * * *', async () => {
                         timed_out: true,
                         timed_out_at: admin.firestore.FieldValue.serverTimestamp()
                     });
-                    const displayName = data.username ? `@${data.username}` : `${data.user_id}`;
+                    const displayName = data.username ? `@${data.username}` : (data.display_name || `${data.user_id}`);
                     const message = `â³ ${displayName} has been timed out for failing to verify within 24 hours.`;
                     await bot.telegram.sendMessage(data.group_id, message, Markup.inlineKeyboard([Markup.button.url('Verify to Restore Access ðŸ”“', getVerifyLink(data.group_id))]));
                 } catch (error) {
@@ -2985,7 +3159,7 @@ cron.schedule('*/30 * * * *', async () => {
                 try {
                     await bot.telegram.kickChatMember(data.group_id, data.user_id);
                     await db.collection('group_verifications').doc(doc.id).update({ removed: true, removed_at: admin.firestore.FieldValue.serverTimestamp() });
-                    const displayName = data.username ? `@${data.username}` : `${data.user_id}`;
+                    const displayName = data.username ? `@${data.username}` : (data.display_name || `${data.user_id}`);
                     const message = `â›” ${displayName} has been removed for failing to verify after timeout.`;
                     await bot.telegram.sendMessage(data.group_id, message);
                 } catch (error) {
