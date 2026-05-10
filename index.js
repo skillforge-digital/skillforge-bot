@@ -263,10 +263,67 @@ const startVerifyCampaign = async (groupId) => {
     }, { merge: true });
 };
 
-const updateVerifyReminderSent = async (groupId) => {
-    await db.collection('group_settings').doc(String(groupId)).set({
+const updateVerifyReminderSent = async (groupId, messageId = null) => {
+    const payload = {
         last_verify_reminder_at: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (messageId != null) payload.last_verify_tag_message_id = String(messageId);
+    await db.collection('group_settings').doc(String(groupId)).set(payload, { merge: true });
+};
+
+const updateVerifyTagMessageId = async (groupId, messageId = null) => {
+    if (messageId == null) return;
+    await db.collection('group_settings').doc(String(groupId)).set({
+        last_verify_tag_message_id: String(messageId)
     }, { merge: true });
+};
+
+const getGroupSettings = async (groupId) => {
+    const doc = await db.collection('group_settings').doc(String(groupId)).get();
+    return doc.exists ? (doc.data() || {}) : null;
+};
+
+const deleteLastVerifyTagMessage = async (groupId, settings) => {
+    const mid = settings?.last_verify_tag_message_id ? String(settings.last_verify_tag_message_id) : null;
+    if (!mid) return;
+    try {
+        await bot.telegram.deleteMessage(groupId, Number(mid));
+    } catch {}
+};
+
+const getBypassAdminIdSet = async (groupId) => {
+    const out = new Set();
+    try {
+        const admins = await bot.telegram.getChatAdministrators(groupId);
+        for (const a of admins || []) {
+            const id = a?.user?.id;
+            if (id != null) out.add(String(id));
+        }
+    } catch {}
+    try {
+        const stored = await listGroupAdmins(db, groupId, 200);
+        for (const row of stored || []) {
+            const id = row?.user_id || row?.id;
+            if (id != null) out.add(String(id));
+        }
+    } catch {}
+    return out;
+};
+
+const bypassVerificationForAdmin = async (groupId, verification) => {
+    const userId = String(verification?.user_id || '');
+    if (!userId) return;
+    if (Boolean(verification.verified) || Boolean(verification.removed)) return;
+    const pendingDelta = verification.timed_out ? 0 : -1;
+    const timedOutDelta = verification.timed_out ? -1 : 0;
+    await adjustGroupCounters(db, groupId, { verified_count: 1, unverified_count: -1, pending_count: pendingDelta, timed_out_count: timedOutDelta });
+    await setGroupVerification(groupId, userId, {
+        verified: true,
+        verified_at: admin.firestore.FieldValue.serverTimestamp(),
+        timed_out: false,
+        timed_out_at: null,
+        bypassed_admin: true
+    });
 };
 
 const stopVerifyCampaign = async (groupId) => {
@@ -404,6 +461,25 @@ const getPdfBuffer = async (title, lines, options = {}) => {
                     }
                 }
 
+                if (options.watermarkText) {
+                    try {
+                        const text = String(options.watermarkText);
+                        const fontSize = Number.isFinite(Number(options.watermarkFontSize)) ? Number(options.watermarkFontSize) : 60;
+                        const opacity = Number.isFinite(Number(options.watermarkOpacity)) ? Number(options.watermarkOpacity) : 0.06;
+                        doc.save();
+                        doc.opacity(opacity);
+                        doc.fillColor('gray');
+                        doc.rotate(-35, { origin: [doc.page.width / 2, doc.page.height / 2] });
+                        doc.fontSize(fontSize).text(text, 0, doc.page.height / 2 - fontSize, {
+                            width: doc.page.width,
+                            align: 'center'
+                        });
+                        doc.restore();
+                        doc.opacity(1);
+                        doc.fillColor('black');
+                    } catch {}
+                }
+
                 if (options.logoTag) {
                     const headerY = doc.page.margins.top - 20;
                     doc.fontSize(10).fillColor('gray').text(options.logoTag, doc.page.margins.left, headerY, {
@@ -476,16 +552,40 @@ const getWeekPerformance = async (groupId, weekStartDate, weekEndDate, plan) => 
     let heldSessions = 0;
     let totalAttendance = 0;
     let totalPossibleAttendance = 0;
+    const feedbackList = [];
 
     for (const classData of classes) {
         const attendanceSnapshot = await db.collection('attendance')
             .where('class_id', '==', classData.id)
             .get();
+        let attendedCount = 0;
+        let totalCount = 0;
+        if (!attendanceSnapshot.empty) {
+            attendedCount = attendanceSnapshot.docs.filter(d => d.data().attended).length;
+            totalCount = attendanceSnapshot.size;
+        }
+        classData.attendance_attended = attendedCount;
+        classData.attendance_total = totalCount;
+        classData.attendance_missed = totalCount ? (totalCount - attendedCount) : 0;
+        classData.was_held = totalCount > 0;
+
         if (!attendanceSnapshot.empty) {
             heldSessions += 1;
-            const attendedCount = attendanceSnapshot.docs.filter(d => d.data().attended).length;
             totalAttendance += attendedCount;
-            totalPossibleAttendance += attendanceSnapshot.size;
+            totalPossibleAttendance += totalCount;
+        }
+
+        try {
+            const feedbackSnapshot = await db.collection('feedback')
+                .where('class_id', '==', classData.id)
+                .get();
+            const feedbackTexts = feedbackSnapshot.docs.map((d) => d.data()?.feedback).filter(Boolean).map((t) => String(t));
+            classData.feedback_count = feedbackTexts.length;
+            classData.feedback_samples = feedbackTexts.slice(-3);
+            feedbackList.push(...feedbackTexts);
+        } catch {
+            classData.feedback_count = 0;
+            classData.feedback_samples = [];
         }
     }
 
@@ -506,7 +606,8 @@ const getWeekPerformance = async (groupId, weekStartDate, weekEndDate, plan) => 
         attendanceRate,
         meterValue,
         expectedSessions,
-        expectedDays
+        expectedDays,
+        feedbackList
     };
 };
 
@@ -537,6 +638,21 @@ const getActiveReviewSession = async (userId) => {
  * @returns {Buffer} The PDF buffer.
  */
 const buildReviewPdf = async (session) => {
+    let performance = session.performance || null;
+    const perfClasses = Array.isArray(performance?.classes) ? performance.classes : null;
+    const perfHasAttendance = Boolean(perfClasses?.length && (perfClasses[0]?.attendance_total != null || perfClasses[0]?.was_held != null));
+    if (!performance || !perfClasses || !perfHasAttendance) {
+        performance = await getWeekPerformance(
+            session.group_id,
+            parseDateString(session.week_start),
+            parseDateString(session.week_end),
+            {
+                sessions_per_week: session.sessions_per_week,
+                min_days_per_week: session.min_days_per_week
+            }
+        );
+    }
+
     const lines = [];
     lines.push('Weekly Review Report');
     lines.push('');
@@ -544,14 +660,44 @@ const buildReviewPdf = async (session) => {
     lines.push(`Review period: ${session.week_start} to ${session.week_end}`);
     lines.push('');
     lines.push('Performance Summary:');
-    lines.push(`â€¢ Sessions held: ${session.performance?.heldSessions ?? 0}/${session.performance?.expectedSessions ?? 0}`);
-    lines.push(`â€¢ Active class days: ${session.performance?.classDays ?? 0}/${session.performance?.expectedDays ?? 0}`);
-    lines.push(`â€¢ Attendance rate: ${session.performance?.attendanceRate ?? 0}%`);
-    lines.push(`â€¢ Performance meter: ${session.performance?.meterValue ?? 0}/100`);
-    lines.push(`â€¢ Target plan: ${session.sessions_per_week || 3} sessions per week, minimum ${session.min_days_per_week || 2} days per week, ${session.expected_duration_minutes || 45} minutes per session.`);
+    lines.push(`• Sessions held: ${performance?.heldSessions ?? 0}/${performance?.expectedSessions ?? 0}`);
+    lines.push(`• Active class days: ${performance?.classDays ?? 0}/${performance?.expectedDays ?? 0}`);
+    lines.push(`• Attendance rate: ${performance?.attendanceRate ?? 0}%`);
+    lines.push(`• Performance meter: ${performance?.meterValue ?? 0}/100`);
+    lines.push(`• Target plan: ${session.sessions_per_week || 3} sessions per week, minimum ${session.min_days_per_week || 2} days per week, ${session.expected_duration_minutes || 45} minutes per session.`);
     if (session.rating) {
-        lines.push(`â€¢ Trainee participation rating: ${session.rating}/5`);
+        lines.push(`• Trainee participation rating: ${session.rating}/5`);
     }
+
+    lines.push('');
+    lines.push('Weekly Activity:');
+    const classRows = Array.isArray(performance?.classes) ? performance.classes : [];
+    if (!classRows.length) {
+        lines.push('No class activity was recorded for this week.');
+    } else {
+        const sorted = [...classRows].sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')) || String(a.time || '').localeCompare(String(b.time || '')));
+        for (const c of sorted) {
+            const date = c.date ? String(c.date) : '';
+            const time = c.time ? String(c.time) : '';
+            const topic = c.topic ? ` - ${String(c.topic)}` : '';
+            const total = Number(c.attendance_total || 0);
+            const attended = Number(c.attendance_attended || 0);
+            const rate = total > 0 ? ((attended / total) * 100).toFixed(1) : '0.0';
+            const fbCount = Number(c.feedback_count || 0);
+            lines.push(`• ${date} ${time}${topic} | Attendance: ${attended}/${total} (${rate}%) | Feedback: ${fbCount}`);
+        }
+    }
+
+    const feedback = Array.isArray(performance?.feedbackList) ? performance.feedbackList : [];
+    if (feedback.length) {
+        lines.push('');
+        lines.push('Feedback Highlights:');
+        feedback.slice(-5).forEach((fb, i) => {
+            const clean = String(fb).replace(/\s+/g, ' ').trim();
+            lines.push(`${i + 1}. ${clean.length > 140 ? `${clean.slice(0, 140)}...` : clean}`);
+        });
+    }
+
     lines.push('');
     lines.push('Review Answers:');
     session.answers?.forEach((answer, index) => {
@@ -564,7 +710,8 @@ const buildReviewPdf = async (session) => {
     lines.push(`Generated on: ${dateToString(new Date())}`);
     return await getPdfBuffer('Weekly Review Report', lines, {
         logoPath: REPORT_LOGO_PATH,
-        logoTag: REPORT_LOGOTAG
+        logoTag: REPORT_LOGOTAG,
+        watermarkText: REPORT_LOGOTAG
     });
 };
 
@@ -2216,10 +2363,10 @@ bot.on('text', async (ctx, next) => {
         const completedSession = { id: sessionId, ...session, ...completedPayload };
         const pdfBuffer = await buildReviewPdf(completedSession);
 
-        await ctx.reply('âœ… Weekly review completed! Generating your PDF now...');
+        await ctx.reply('✅ Weekly review completed and documented. Generating your PDF now...');
         await ctx.replyWithDocument({ source: pdfBuffer, filename: `weekly_review_${session.group_name}_${session.week_start}_to_${session.week_end}.pdf` });
         if (SERVER_URL) {
-            await ctx.reply(`You can also download it again here:\n${SERVER_URL}/review/${sessionId}`);
+            await ctx.reply(`Download: ${SERVER_URL}/review/${sessionId}\nPrint: ${SERVER_URL}/review/${sessionId}/print\n\nSubmit the PDF to your head of units.`);
         }
         return;
     }
@@ -2970,8 +3117,21 @@ bot.on('new_chat_members', async (ctx) => {
             }
         }
 
-        const message = `Welcome to Skillforge Digital.\n\nTo receive class reminders in private messages, you must verify by messaging the bot.\n\nTap Verify Now, then press Start (or send /verify in private chat).`;
-        await ctx.telegram.sendMessage(groupId, message, Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))]));
+        const membersToTag = (newMembers || []).filter(shouldTrackUser).slice(0, 10);
+        const mentions = membersToTag.map((m) => {
+            const label = m.username ? `@${m.username}` : (m.first_name ? String(m.first_name) : `user ${m.id}`);
+            return buildUserMentionHtml(m.id, label);
+        }).join(' ');
+
+        const base = `Welcome to Skillforge Digital.\n\nTo receive class reminders in private messages, you must verify by messaging the bot.\n\n⏳ You have 24 hours to verify. If you do not verify, you will be muted, and later removed.\n\nTap Verify Now, then press Start (or send /verify in private chat).`;
+        const message = mentions ? `${mentions}\n\n${base}` : base;
+        const settings = await getGroupSettings(groupId);
+        await deleteLastVerifyTagMessage(groupId, settings);
+        const msg = await ctx.telegram.sendMessage(groupId, message, {
+            parse_mode: 'HTML',
+            ...Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))])
+        });
+        await updateVerifyTagMessageId(groupId, msg?.message_id || null);
     } catch (error) {
         console.log("Could not send welcome message (Bot might have been kicked):", error.message);
     }
@@ -3817,6 +3977,7 @@ cron.schedule('0 */3 * * *', async () => {
                 const unverifiedSnapshot = await db.collection('group_verifications')
                     .where('group_id', '==', groupId)
                     .where('verified', '==', false)
+                    .where('timed_out', '==', false)
                     .where('removed', '==', false)
                     .get();
 
@@ -3825,24 +3986,43 @@ cron.schedule('0 */3 * * *', async () => {
                     continue;
                 }
 
-                const unverifiedUsers = unverifiedSnapshot.docs
-                    .map(d => d.data())
+                const bypassAdmins = await getBypassAdminIdSet(groupId);
+                const allUnverified = unverifiedSnapshot.docs
+                    .map((d) => ({ id: d.id, ...d.data() }))
                     .filter((u) => u && !u.is_bot && !EXCLUDED_SYSTEM_USER_IDS.has(String(u.user_id)));
+
+                const tagCandidates = [];
+                for (const u of allUnverified) {
+                    const uid = String(u.user_id);
+                    if (bypassAdmins.has(uid)) {
+                        await bypassVerificationForAdmin(groupId, u);
+                        continue;
+                    }
+                    tagCandidates.push(u);
+                }
+
+                if (!tagCandidates.length) {
+                    await stopVerifyCampaign(groupId);
+                    continue;
+                }
+
                 const mentionLimit = 20;
-                const mentions = unverifiedUsers.slice(0, mentionLimit).map((u) => {
+                const mentions = tagCandidates.slice(0, mentionLimit).map((u) => {
                     const label = u.username ? `@${u.username}` : (u.display_name || `user ${u.user_id}`);
                     return buildUserMentionHtml(u.user_id, label);
                 }).join(' ');
 
-                const remaining = unverifiedUsers.length - Math.min(unverifiedUsers.length, mentionLimit);
+                const remaining = tagCandidates.length - Math.min(tagCandidates.length, mentionLimit);
                 const remainingLine = remaining > 0 ? `\n\nAnd ${remaining} more unverified member(s).` : '';
-                const message = `⚠️ <b>Verification Reminder</b>\n\n${mentions}${remainingLine}\n\nIf you have not verified yet, please verify now to receive class reminders in DM.\n\nIf you are not tagged here, send /verify in this group or message the bot privately with /verify.`;
+                const message = `⚠️ <b>Verification Reminder</b>\n\n${mentions}${remainingLine}\n\n⏳ You have 24 hours to verify after joining. If you do not verify, you will be muted, and later removed.\n\nVerify now to receive class reminders in DM.\n\nIf you are not tagged here, send /verify in this group or message the bot privately with /verify.`;
 
-                await bot.telegram.sendMessage(groupId, message, {
+                const currentSettings = settings || (await getGroupSettings(groupId));
+                await deleteLastVerifyTagMessage(groupId, currentSettings);
+                const msg = await bot.telegram.sendMessage(groupId, message, {
                     parse_mode: 'HTML',
                     ...Markup.inlineKeyboard([Markup.button.url('Verify Now ✅', getVerifyLink(groupId))])
                 });
-                await updateVerifyReminderSent(groupId);
+                await updateVerifyReminderSent(groupId, msg?.message_id || null);
             } catch (error) {
                 await reportError('3-hour verification reminder failed', error);
             }
@@ -3863,10 +4043,21 @@ cron.schedule('*/30 * * * *', async () => {
             .where('removed', '==', false)
             .where('joined_at', '<=', timeoutThreshold)
             .get();
+        const adminCache = new Map();
         if (!snapshot.empty) {
             for (const doc of snapshot.docs) {
                 const data = doc.data();
                 try {
+                    const groupId = String(data.group_id);
+                    const userId = String(data.user_id);
+                    if (groupId && userId) {
+                        if (!adminCache.has(groupId)) adminCache.set(groupId, await getBypassAdminIdSet(groupId));
+                        const bypassSet = adminCache.get(groupId);
+                        if (bypassSet && bypassSet.has(userId)) {
+                            await bypassVerificationForAdmin(groupId, { id: doc.id, ...data });
+                            continue;
+                        }
+                    }
                     await bot.telegram.restrictChatMember(data.group_id, data.user_id, { permissions: { can_send_messages: false } });
                     await db.collection('group_verifications').doc(doc.id).update({
                         timed_out: true,
@@ -3895,6 +4086,16 @@ cron.schedule('*/30 * * * *', async () => {
             for (const doc of removalSnapshot.docs) {
                 const data = doc.data();
                 try {
+                    const groupId = String(data.group_id);
+                    const userId = String(data.user_id);
+                    if (groupId && userId) {
+                        if (!adminCache.has(groupId)) adminCache.set(groupId, await getBypassAdminIdSet(groupId));
+                        const bypassSet = adminCache.get(groupId);
+                        if (bypassSet && bypassSet.has(userId)) {
+                            await bypassVerificationForAdmin(groupId, { id: doc.id, ...data });
+                            continue;
+                        }
+                    }
                     await bot.telegram.kickChatMember(data.group_id, data.user_id);
                     await db.collection('group_verifications').doc(doc.id).update({ removed: true, removed_at: admin.firestore.FieldValue.serverTimestamp() });
                     await adjustGroupCounters(db, data.group_id, { unverified_count: -1, timed_out_count: -1 });
@@ -3917,6 +4118,7 @@ cron.schedule('*/30 * * * *', async () => {
 
 app.get('/public/menu.html', (req, res) => res.redirect('/menu'));
 app.use('/public', express.static('public'));
+app.get('/logo.jpg', (req, res) => res.sendFile(path.join(__dirname, 'logo.jpg')));
 
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
 app.get('/admin/', (req, res) => res.redirect('/admin'));
@@ -4259,12 +4461,49 @@ app.get('/review/:id', async (req, res) => {
         const session = { id: sessionDoc.id, ...sessionDoc.data() };
         const pdfBuffer = await buildReviewPdf(session);
         res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename="weekly_review_${session.group_name}_${session.week_start}_to_${session.week_end}.pdf"`);
+        const disposition = String(req.query?.inline || '') === '1' ? 'inline' : 'attachment';
+        res.setHeader('Content-Disposition', `${disposition}; filename="weekly_review_${session.group_name}_${session.week_start}_to_${session.week_end}.pdf"`);
         res.send(pdfBuffer);
     } catch (error) {
         console.error('Review route error:', error);
         res.status(500).send('Unable to generate review PDF.');
     }
+});
+
+app.get('/review/:id/print', async (req, res) => {
+    const id = String(req.params.id || '');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Weekly Review Print</title>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    header { display: flex; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid #e5e7eb; }
+    header img { height: 34px; width: auto; border-radius: 4px; }
+    header .spacer { flex: 1; }
+    button { appearance: none; border: 1px solid #111827; background: #111827; color: #fff; padding: 8px 12px; border-radius: 8px; cursor: pointer; }
+    button.secondary { background: #fff; color: #111827; }
+    main { height: calc(100% - 58px); }
+    iframe { width: 100%; height: 100%; border: 0; }
+    @media print { header { display: none; } main { height: 100%; } }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="/logo.jpg" alt="Logo">
+    <strong>Weekly Review Report</strong>
+    <div class="spacer"></div>
+    <button class="secondary" onclick="location.href='/review/${encodeURIComponent(id)}'">Download PDF</button>
+    <button onclick="document.getElementById('pdf').contentWindow.print()">Print</button>
+  </header>
+  <main>
+    <iframe id="pdf" src="/review/${encodeURIComponent(id)}?inline=1"></iframe>
+  </main>
+</body>
+</html>`);
 });
 
 const PORT = process.env.PORT || 3000;
