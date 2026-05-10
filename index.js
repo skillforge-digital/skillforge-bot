@@ -211,9 +211,38 @@ const requireSpecialist = async (ctx) => {
 
 const isSuperAdminId = (userId) => SUPER_ADMIN_IDS.has(String(userId));
 
+const isStaffUser = async (userId) => {
+    const uid = String(userId);
+    if (isSuperAdminId(uid)) return true;
+    return await isSpecialist(uid);
+};
+
+const requireStaff = async (ctx) => {
+    const uid = ctx.from?.id ? String(ctx.from.id) : null;
+    if (!uid) return false;
+    const ok = await isStaffUser(uid);
+    if (!ok) {
+        await ctx.reply('Staff only.');
+        return false;
+    }
+    return true;
+};
+
+const requireClassroomOwnerOrSuperAdmin = async (ctx, groupId) => {
+    const uid = ctx.from?.id ? String(ctx.from.id) : null;
+    if (!uid) return false;
+    if (isSuperAdminId(uid)) return true;
+    const roomDoc = await db.collection('classrooms').doc(String(groupId)).get();
+    const room = roomDoc.exists ? roomDoc.data() : null;
+    if (room && String(room.specialist_id || '') === uid) return true;
+    await ctx.reply('You do not have access to this group.');
+    return false;
+};
+
 const requireGroupManager = async (ctx, groupId) => {
     const uid = ctx.from?.id ? String(ctx.from.id) : null;
     if (!uid) return false;
+    if (isSuperAdminId(uid)) return true;
     if (await isSpecialist(uid)) return true;
     const ok = await isGroupAdmin(db, String(groupId), uid);
     if (!ok) {
@@ -933,6 +962,10 @@ bot.command('help', (ctx) => {
 ` +
             `• /claim - Claim your Telegram classroom group.
 ` +
+            `• /mygroups - List your classroom groups (pick instead of typing group_id).
+` +
+            `• /announce - Send an announcement to a group (or all groups if super admin).
+` +
             `• /setclass <group_id> <HH:MM> [topic] - Schedule today’s live session with optional topic.
 ` +
             `• /rescheduleclass <group_id> <old_time> <new_time> - Move a session to a new time.
@@ -980,6 +1013,137 @@ bot.command('help', (ctx) => {
     }).catch(() => {
         ctx.reply('Use /help again.');
     });
+});
+
+const getAccessibleClassrooms = async (userId) => {
+    const uid = String(userId);
+    const query = isSuperAdminId(uid)
+        ? db.collection('classrooms')
+        : db.collection('classrooms').where('specialist_id', '==', uid);
+    const snap = await query.get();
+    return snap.docs.map((d) => ({ id: String(d.id), ...(d.data() || {}) }));
+};
+
+bot.command('mygroups', async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /mygroups in a private chat with the bot.');
+        }
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const rooms = await getAccessibleClassrooms(String(ctx.from.id));
+        if (!rooms.length) return ctx.reply('No classroom groups found.');
+        const buttons = rooms.slice(0, 20).map((r) => [Markup.button.callback(`${r.group_name || r.id}`, `groupmenu_${r.id}`)]);
+        return ctx.reply('Select a group:', Markup.inlineKeyboard(buttons));
+    } catch (error) {
+        await reportError('mygroups command failed', error);
+        return ctx.reply('Unable to load groups right now.');
+    }
+});
+
+bot.action(/^groupmenu_(.+)$/, async (ctx) => {
+    try {
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const groupId = String(ctx.match[1]);
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('Group not found.');
+            return;
+        }
+        const room = roomDoc.data() || {};
+        if (!isSuperAdminId(String(ctx.from.id)) && String(room.specialist_id || '') !== String(ctx.from.id)) {
+            await ctx.reply('You do not have access to this group.');
+            return;
+        }
+        const title = room.group_name || groupId;
+        const buttons = [
+            [Markup.button.callback('Status', `gstatus_${groupId}`)],
+            [Markup.button.callback('Roster', `roster_${groupId}`)],
+            [Markup.button.callback('Announce', `announce_to_${groupId}`)],
+            [Markup.button.callback('Recount', `recount_${groupId}`)],
+            [Markup.button.callback('Admins', `gadmins_${groupId}`)]
+        ];
+        await ctx.reply(`Group: ${title}\nID: ${groupId}`, Markup.inlineKeyboard(buttons));
+    } catch (error) {
+        await reportError('groupmenu action failed', error);
+        await ctx.reply('Unable to open group menu right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
+bot.command('announce', async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /announce in a private chat with the bot.');
+        }
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const uid = String(ctx.from.id);
+        const rooms = await getAccessibleClassrooms(uid);
+        const buttons = [];
+        if (isSuperAdminId(uid)) {
+            buttons.push([Markup.button.callback('All groups', 'announce_all')]);
+        }
+        for (const r of rooms.slice(0, 20)) {
+            buttons.push([Markup.button.callback(`${r.group_name || r.id}`, `announce_to_${r.id}`)]);
+        }
+        if (!buttons.length) return ctx.reply('No classroom groups found.');
+        return ctx.reply('Select where to send the announcement:', Markup.inlineKeyboard(buttons));
+    } catch (error) {
+        await reportError('announce command failed', error);
+        return ctx.reply('Unable to start announcement right now.');
+    }
+});
+
+const setAnnouncementDraft = async (userId, payload) => {
+    await db.collection('announcement_drafts').doc(String(userId)).set({
+        user_id: String(userId),
+        ...payload,
+        updated_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+};
+
+const clearAnnouncementDraft = async (userId) => {
+    await db.collection('announcement_drafts').doc(String(userId)).delete().catch(() => {});
+};
+
+bot.action('announce_all', async (ctx) => {
+    try {
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const uid = String(ctx.from.id);
+        if (!isSuperAdminId(uid)) {
+            await ctx.reply('Only super admin can announce to all groups.');
+            return;
+        }
+        await setAnnouncementDraft(uid, { target: { mode: 'all' }, stage: 'await_text', created_at: admin.firestore.FieldValue.serverTimestamp() });
+        await ctx.reply('Send the announcement text now (your next message will be sent to all groups).');
+    } catch (error) {
+        await reportError('announce_all action failed', error);
+        await ctx.reply('Unable to start announcement right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
+bot.action(/^announce_to_(.+)$/, async (ctx) => {
+    try {
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const uid = String(ctx.from.id);
+        const groupId = String(ctx.match[1]);
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
+        await setAnnouncementDraft(uid, { target: { mode: 'group', group_ids: [groupId] }, stage: 'await_text', created_at: admin.firestore.FieldValue.serverTimestamp() });
+        await ctx.reply('Send the announcement text now (your next message will be posted to the selected group).');
+    } catch (error) {
+        await reportError('announce_to action failed', error);
+        await ctx.reply('Unable to start announcement right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
 });
 
 bot.command('status', async (ctx) => {
@@ -1076,6 +1240,61 @@ bot.command('status', async (ctx) => {
     } catch (error) {
         await reportError('Status command failed', error);
         ctx.reply('âŒ Unable to fetch status right now. Please try again later.');
+    }
+});
+
+bot.action(/^gstatus_(.+)$/, async (ctx) => {
+    try {
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const groupId = String(ctx.match[1]);
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
+
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('Group not found.');
+            return;
+        }
+        const room = roomDoc.data() || {};
+
+        const todayStr = getLagosDateString();
+        const classesSnapshot = await db.collection('classes')
+            .where('group_id', '==', groupId)
+            .where('date', '==', todayStr)
+            .where('status', '==', 'active')
+            .get();
+
+        let response = `*${room.group_name || groupId}* status for today (${todayStr}):\n`;
+        if (classesSnapshot.empty) {
+            response += '\nNo live sessions are scheduled today.';
+        } else {
+            for (const classDoc of classesSnapshot.docs) {
+                const classData = classDoc.data();
+                response += `\n• Live class at *${classData.time}*`;
+            }
+        }
+
+        const settingsDoc = await db.collection('group_settings').doc(groupId).get();
+        const settings = settingsDoc.exists ? settingsDoc.data() : null;
+        const stored = settings && settings.counters_initialized === true && Number.isFinite(Number(settings.pending_count)) ? Number(settings.pending_count) : null;
+        if (stored != null) {
+            response += `\n\nPending verifications: *${stored}*`;
+        } else {
+            const pendingSnapshot = await db.collection('group_verifications')
+                .where('group_id', '==', groupId)
+                .where('verified', '==', false)
+                .where('timed_out', '==', false)
+                .where('removed', '==', false)
+                .get();
+            response += `\n\nPending verifications: *${pendingSnapshot.size}*`;
+        }
+        await ctx.reply(response, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await reportError('gstatus action failed', error);
+        await ctx.reply('Unable to fetch status right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
     }
 });
 
@@ -1657,6 +1876,44 @@ bot.on('message', async (ctx, next) => {
                     }
                 }
             }
+
+            const replyToMessageId = ctx.message?.reply_to_message?.message_id ? String(ctx.message.reply_to_message.message_id) : null;
+            if (replyToMessageId && ctx.from && shouldTrackUser(ctx.from)) {
+                const groupId = String(ctx.chat.id);
+                const mapDocId = `${groupId}_${replyToMessageId}`;
+                const mapDoc = await db.collection('announcement_messages').doc(mapDocId).get();
+                if (mapDoc.exists) {
+                    const map = mapDoc.data() || {};
+                    const announcerId = String(map.announcer_id || '');
+                    const announcementId = String(map.announcement_id || '');
+                    if (announcerId && announcementId) {
+                        const groupName = String(map.group_name || ctx.chat.title || groupId);
+                        const traineeId = String(ctx.from.id);
+                        const threadId = `${announcementId}_${groupId}_${traineeId}`;
+                        const fromLabel = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name ? String(ctx.from.first_name) : traineeId);
+                        const when = ctx.message?.date ? new Date(ctx.message.date * 1000) : new Date();
+                        const text = ctx.message?.text || ctx.message?.caption || '';
+
+                        await db.collection('announcement_threads').doc(threadId).set({
+                            thread_id: threadId,
+                            announcement_id: announcementId,
+                            group_id: groupId,
+                            group_name: groupName,
+                            announcer_id: announcerId,
+                            trainee_id: traineeId,
+                            created_at: admin.firestore.FieldValue.serverTimestamp(),
+                            last_message_at: admin.firestore.FieldValue.serverTimestamp()
+                        }, { merge: true });
+
+                        const header = `💬 <b>Announcement reply</b>\nGroup: <b>${escapeHtml(groupName)}</b>\nFrom: ${buildUserMentionHtml(traineeId, fromLabel)}\nAt: <b>${escapeHtml(when.toISOString())}</b>\n\n`;
+                        const body = escapeHtml(text || '[non-text message]');
+                        await bot.telegram.sendMessage(announcerId, `${header}${body}`, {
+                            parse_mode: 'HTML',
+                            ...Markup.inlineKeyboard([[Markup.button.callback('Reply', `thread_reply_${threadId}`)]])
+                        });
+                    }
+                }
+            }
         }
     } catch {}
 
@@ -1673,6 +1930,68 @@ bot.on('message', async (ctx, next) => {
     }
 });
 
+const setAnnouncementReplySession = async (userId, payload) => {
+    await db.collection('announcement_reply_sessions').doc(String(userId)).set({
+        user_id: String(userId),
+        ...payload,
+        updated_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+};
+
+const clearAnnouncementReplySession = async (userId) => {
+    await db.collection('announcement_reply_sessions').doc(String(userId)).delete().catch(() => {});
+};
+
+bot.action(/^thread_reply_(.+)$/, async (ctx) => {
+    try {
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const uid = String(ctx.from.id);
+        const threadId = String(ctx.match[1]);
+        const threadDoc = await db.collection('announcement_threads').doc(threadId).get();
+        if (!threadDoc.exists) {
+            await ctx.reply('Thread not found.');
+            return;
+        }
+        const thread = threadDoc.data() || {};
+        if (!isSuperAdminId(uid) && String(thread.announcer_id || '') !== uid) {
+            await ctx.reply('You do not have access to this thread.');
+            return;
+        }
+        await setAnnouncementReplySession(uid, { stage: 'await_text', role: 'announcer', thread_id: threadId });
+        await ctx.reply('Send your reply message now (your next message will be delivered).');
+    } catch (error) {
+        await reportError('thread_reply action failed', error);
+        await ctx.reply('Unable to start reply right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
+bot.action(/^thread_user_(.+)$/, async (ctx) => {
+    try {
+        const uid = String(ctx.from.id);
+        const threadId = String(ctx.match[1]);
+        const threadDoc = await db.collection('announcement_threads').doc(threadId).get();
+        if (!threadDoc.exists) {
+            await ctx.reply('Thread not found.');
+            return;
+        }
+        const thread = threadDoc.data() || {};
+        if (String(thread.trainee_id || '') !== uid) {
+            await ctx.reply('You do not have access to this thread.');
+            return;
+        }
+        await setAnnouncementReplySession(uid, { stage: 'await_text', role: 'trainee', thread_id: threadId });
+        await ctx.reply('Send your reply message now (your next message will be delivered).');
+    } catch (error) {
+        await reportError('thread_user action failed', error);
+        await ctx.reply('Unable to start reply right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
 // Handle feedback messages in private chat and active review sessions
 bot.on('text', async (ctx, next) => {
     if (ctx.chat.type !== 'private') return next();
@@ -1683,6 +2002,129 @@ bot.on('text', async (ctx, next) => {
     if (!messageText || messageText.startsWith('/')) {
         return next();
     }
+
+    try {
+        const replySessionDoc = await db.collection('announcement_reply_sessions').doc(userId).get();
+        if (replySessionDoc.exists) {
+            const sess = replySessionDoc.data() || {};
+            if (String(sess.stage || '') === 'await_text' && sess.thread_id) {
+                const threadId = String(sess.thread_id);
+                const threadDoc = await db.collection('announcement_threads').doc(threadId).get();
+                if (!threadDoc.exists) {
+                    await clearAnnouncementReplySession(userId);
+                    await ctx.reply('Thread not found.');
+                    return;
+                }
+                const thread = threadDoc.data() || {};
+                const role = String(sess.role || '');
+                const text = String(messageText || '').trim();
+                if (!text) return;
+
+                if (role === 'announcer') {
+                    const toId = String(thread.trainee_id || '');
+                    const groupName = String(thread.group_name || thread.group_id || '');
+                    const fromName = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name ? String(ctx.from.first_name) : userId);
+                    try {
+                        await bot.telegram.sendMessage(toId, `📩 <b>Reply from ${escapeHtml(fromName)}</b>\nGroup: <b>${escapeHtml(groupName)}</b>\n\n${escapeHtml(text)}`, {
+                            parse_mode: 'HTML',
+                            ...Markup.inlineKeyboard([[Markup.button.callback('Reply', `thread_user_${threadId}`)]])
+                        });
+                        await ctx.reply('Delivered.');
+                    } catch (error) {
+                        await ctx.reply('Failed to deliver (user may not have started the bot or has blocked it).');
+                    }
+                    await db.collection('announcement_threads').doc(threadId).set({ last_message_at: admin.firestore.FieldValue.serverTimestamp(), last_sender: 'announcer' }, { merge: true });
+                    await clearAnnouncementReplySession(userId);
+                    return;
+                }
+
+                if (role === 'trainee') {
+                    const toId = String(thread.announcer_id || '');
+                    const groupName = String(thread.group_name || thread.group_id || '');
+                    const fromLabel = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name ? String(ctx.from.first_name) : userId);
+                    await bot.telegram.sendMessage(toId, `💬 <b>Reply</b>\nGroup: <b>${escapeHtml(groupName)}</b>\nFrom: ${buildUserMentionHtml(userId, fromLabel)}\n\n${escapeHtml(text)}`, {
+                        parse_mode: 'HTML',
+                        ...Markup.inlineKeyboard([[Markup.button.callback('Reply', `thread_reply_${threadId}`)]])
+                    });
+                    await db.collection('announcement_threads').doc(threadId).set({ last_message_at: admin.firestore.FieldValue.serverTimestamp(), last_sender: 'trainee' }, { merge: true });
+                    await clearAnnouncementReplySession(userId);
+                    await ctx.reply('Delivered.');
+                    return;
+                }
+            }
+        }
+    } catch {}
+
+    try {
+        const draftDoc = await db.collection('announcement_drafts').doc(userId).get();
+        if (draftDoc.exists) {
+            const draft = draftDoc.data() || {};
+            if (String(draft.stage || '') === 'await_text') {
+                const target = draft.target || {};
+                const uid = String(ctx.from.id);
+                const announcerName = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name ? String(ctx.from.first_name) : uid);
+
+                let rooms = [];
+                if (String(target.mode || '') === 'all') {
+                    if (!isSuperAdminId(uid)) {
+                        await clearAnnouncementDraft(uid);
+                        await ctx.reply('Only super admin can announce to all groups.');
+                        return;
+                    }
+                    rooms = await getAccessibleClassrooms(uid);
+                } else {
+                    const ids = Array.isArray(target.group_ids) ? target.group_ids.map(String) : [];
+                    const items = [];
+                    for (const gid of ids) {
+                        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, gid);
+                        if (!accessOk) continue;
+                        const roomDoc = await db.collection('classrooms').doc(String(gid)).get();
+                        if (roomDoc.exists) items.push({ id: String(roomDoc.id), ...(roomDoc.data() || {}) });
+                    }
+                    rooms = items;
+                }
+
+                if (!rooms.length) {
+                    await clearAnnouncementDraft(uid);
+                    await ctx.reply('No target groups found.');
+                    return;
+                }
+
+                const annRef = await db.collection('announcements').add({
+                    announcer_id: uid,
+                    announcer_name: announcerName,
+                    text: String(messageText),
+                    target_count: rooms.length,
+                    created_at: admin.firestore.FieldValue.serverTimestamp()
+                });
+                const announcementId = annRef.id;
+
+                let sent = 0;
+                for (const room of rooms) {
+                    const groupId = String(room.group_id || room.id);
+                    if (!groupId) continue;
+                    const payload = `📢 <b>Announcement</b>\nFrom: <b>${escapeHtml(announcerName)}</b>\n\n${escapeHtml(String(messageText))}\n\nReply to this message to respond.`;
+                    try {
+                        const msg = await bot.telegram.sendMessage(groupId, payload, { parse_mode: 'HTML' });
+                        await db.collection('announcement_messages').doc(`${groupId}_${String(msg.message_id)}`).set({
+                            announcement_id: announcementId,
+                            group_id: groupId,
+                            group_name: String(room.group_name || groupId),
+                            announcer_id: uid,
+                            announcer_name: announcerName,
+                            message_id: String(msg.message_id),
+                            created_at: admin.firestore.FieldValue.serverTimestamp()
+                        }, { merge: true });
+                        sent += 1;
+                    } catch (error) {}
+                }
+
+                await clearAnnouncementDraft(uid);
+                await ctx.reply(`Announcement sent to ${sent} group(s).`);
+                return;
+            }
+        }
+    } catch {}
 
     const activeSessionSnapshot = await db.collection('questionnaire_sessions')
         .where('user_id', '==', userId)
@@ -2742,24 +3184,12 @@ const sendScheduleGroupPicker = async (ctx, specialistId) => {
 };
 
 const sendRosterGroupPicker = async (ctx, specialistId) => {
-    const specialistDoc = await db.collection('specialists').doc(specialistId).get();
-    if (!specialistDoc.exists) {
-        return ctx.reply('You are not a registered specialist.');
-    }
-
-    const groupsSnapshot = await db.collection('classrooms')
-        .where('specialist_id', '==', specialistId)
-        .get();
-
-    if (groupsSnapshot.empty) {
+    const rooms = await getAccessibleClassrooms(String(specialistId));
+    if (!rooms.length) {
         return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
     }
 
-    const buttons = [];
-    groupsSnapshot.docs.forEach(doc => {
-        const room = doc.data();
-        buttons.push([Markup.button.callback(`${room.group_name || doc.id}`, `roster_${doc.id}`)]);
-    });
+    const buttons = rooms.slice(0, 20).map((room) => [Markup.button.callback(`${room.group_name || room.id}`, `roster_${room.id}`)]);
 
     return ctx.reply('Select a group to view trainee roster:', Markup.inlineKeyboard(buttons));
 };
@@ -2768,17 +3198,18 @@ bot.command('roster', async (ctx) => {
     if (ctx.chat.type !== 'private') {
         return ctx.reply('Please use /roster in a private chat with the bot.');
     }
-    const ok = await requireSpecialist(ctx);
+    const ok = await requireStaff(ctx);
     if (!ok) return;
     return await sendRosterGroupPicker(ctx, String(ctx.from.id));
 });
 
 bot.action(/^roster_(.+)$/, async (ctx) => {
     try {
-        const ok = await requireSpecialist(ctx);
+        const ok = await requireStaff(ctx);
         if (!ok) return;
-        const specialistId = String(ctx.from.id);
         const groupId = String(ctx.match[1]);
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
 
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) {
@@ -2786,10 +3217,6 @@ bot.action(/^roster_(.+)$/, async (ctx) => {
             return;
         }
         const room = roomDoc.data() || {};
-        if (String(room.specialist_id || '') !== specialistId) {
-            await ctx.reply('You do not have access to this group roster.');
-            return;
-        }
 
         const verifiedSnapshot = await db.collection('group_verifications')
             .where('group_id', '==', groupId)
@@ -2830,17 +3257,22 @@ bot.command('recount', async (ctx) => {
         if (ctx.chat.type !== 'private') {
             return ctx.reply('Please use /recount in a private chat with the bot.');
         }
-        const ok = await requireSpecialist(ctx);
+        const ok = await requireStaff(ctx);
         if (!ok) return;
         const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
         const groupId = parts[1] ? String(parts[1]) : null;
-        if (!groupId) return ctx.reply('Usage: /recount <group_id>');
+        if (!groupId) {
+            const rooms = await getAccessibleClassrooms(String(ctx.from.id));
+            if (!rooms.length) return ctx.reply('No classroom groups found.');
+            const buttons = rooms.slice(0, 20).map((r) => [Markup.button.callback(`${r.group_name || r.id}`, `recount_${r.id}`)]);
+            return ctx.reply('Select a group to recount:', Markup.inlineKeyboard(buttons));
+        }
 
-        const specialistId = String(ctx.from.id);
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) return ctx.reply('Group not found.');
         const room = roomDoc.data() || {};
-        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
 
         const snap = await db.collection('group_verifications').where('group_id', '==', groupId).get();
         const docs = snap.docs.map((d) => d.data()).filter(Boolean);
@@ -2858,22 +3290,53 @@ bot.command('recount', async (ctx) => {
     }
 });
 
+bot.action(/^recount_(.+)$/, async (ctx) => {
+    try {
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const groupId = String(ctx.match[1]);
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('Group not found.');
+            return;
+        }
+        const room = roomDoc.data() || {};
+        const snap = await db.collection('group_verifications').where('group_id', '==', groupId).get();
+        const docs = snap.docs.map((d) => d.data()).filter(Boolean);
+        const counters = computeCountersFromVerificationDocs(docs);
+        await db.collection('group_settings').doc(groupId).set({
+            group_id: groupId,
+            ...counters,
+            counters_initialized: true,
+            counters_recalculated_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        await ctx.reply(`Counters updated for ${room.group_name || groupId}.`);
+    } catch (error) {
+        await reportError('recount action failed', error);
+        await ctx.reply('Unable to recount right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
 bot.command('addadmin', async (ctx) => {
     try {
         if (ctx.chat.type !== 'private') {
             return ctx.reply('Please use /addadmin in a private chat with the bot.');
         }
-        const ok = await requireSpecialist(ctx);
+        const ok = await requireStaff(ctx);
         if (!ok) return;
         const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
         const groupId = parts[1] ? String(parts[1]) : null;
         const targetId = parts[2] ? String(parts[2]) : null;
         if (!groupId || !targetId) return ctx.reply('Usage: /addadmin <group_id> <user_id>');
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
         const specialistId = String(ctx.from.id);
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) return ctx.reply('Group not found.');
-        const room = roomDoc.data() || {};
-        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
 
         await setGroupAdmin(db, groupId, targetId, {
             added_by: specialistId,
@@ -2891,17 +3354,16 @@ bot.command('removeadmin', async (ctx) => {
         if (ctx.chat.type !== 'private') {
             return ctx.reply('Please use /removeadmin in a private chat with the bot.');
         }
-        const ok = await requireSpecialist(ctx);
+        const ok = await requireStaff(ctx);
         if (!ok) return;
         const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
         const groupId = parts[1] ? String(parts[1]) : null;
         const targetId = parts[2] ? String(parts[2]) : null;
         if (!groupId || !targetId) return ctx.reply('Usage: /removeadmin <group_id> <user_id>');
-        const specialistId = String(ctx.from.id);
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) return ctx.reply('Group not found.');
-        const room = roomDoc.data() || {};
-        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
 
         await removeGroupAdmin(db, groupId, targetId);
         return ctx.reply('Admin removed.');
@@ -2916,17 +3378,21 @@ bot.command('listadmins', async (ctx) => {
         if (ctx.chat.type !== 'private') {
             return ctx.reply('Please use /listadmins in a private chat with the bot.');
         }
-        const ok = await requireSpecialist(ctx);
+        const ok = await requireStaff(ctx);
         if (!ok) return;
         const parts = String(ctx.message?.text || '').trim().split(/\s+/).filter(Boolean);
         const groupId = parts[1] ? String(parts[1]) : null;
-        if (!groupId) return ctx.reply('Usage: /listadmins <group_id>');
-        const specialistId = String(ctx.from.id);
+        if (!groupId) {
+            const rooms = await getAccessibleClassrooms(String(ctx.from.id));
+            if (!rooms.length) return ctx.reply('No classroom groups found.');
+            const buttons = rooms.slice(0, 20).map((r) => [Markup.button.callback(`${r.group_name || r.id}`, `gadmins_${r.id}`)]);
+            return ctx.reply('Select a group:', Markup.inlineKeyboard(buttons));
+        }
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) return ctx.reply('Group not found.');
         const room = roomDoc.data() || {};
-        if (String(room.specialist_id || '') !== specialistId) return ctx.reply('You do not have access to this group.');
-
         const admins = await listGroupAdmins(db, groupId, 80);
         if (!admins.length) return ctx.reply('No stored admins for this group.');
         const lines = admins.map((a) => `• ${a.user_id}`).join('\n');
@@ -2934,6 +3400,34 @@ bot.command('listadmins', async (ctx) => {
     } catch (error) {
         await reportError('listadmins command failed', error);
         return ctx.reply('Unable to list admins right now.');
+    }
+});
+
+bot.action(/^gadmins_(.+)$/, async (ctx) => {
+    try {
+        const ok = await requireStaff(ctx);
+        if (!ok) return;
+        const groupId = String(ctx.match[1]);
+        const accessOk = await requireClassroomOwnerOrSuperAdmin(ctx, groupId);
+        if (!accessOk) return;
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('Group not found.');
+            return;
+        }
+        const room = roomDoc.data() || {};
+        const admins = await listGroupAdmins(db, groupId, 80);
+        if (!admins.length) {
+            await ctx.reply(`No stored admins for ${room.group_name || groupId}.`);
+            return;
+        }
+        const lines = admins.map((a) => `• ${a.user_id}`).join('\n');
+        await ctx.reply(`Admins for ${room.group_name || groupId}:\n${lines}`);
+    } catch (error) {
+        await reportError('gadmins action failed', error);
+        await ctx.reply('Unable to list admins right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
     }
 });
 
