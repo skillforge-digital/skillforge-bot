@@ -1,6 +1,7 @@
 ﻿require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const { Telegraf, Markup } = require('telegraf');
 const PDFDocument = require('pdfkit');
 const admin = require('firebase-admin');
@@ -43,11 +44,23 @@ const BOT_USERNAME_SAFE = (process.env.BOT_USERNAME || 'skillforge_bot').replace
 const BOT_LINK_BASE = `https://t.me/${BOT_USERNAME_SAFE}?start=`;
 const getVerifyLink = (groupId) => `${BOT_LINK_BASE}verify_${encodeURIComponent(String(groupId))}`;
 const REPORT_CHAT_ID = process.env.REPORT_CHAT_ID || null;
+const MOD_LOG_CHAT_ID = process.env.MOD_LOG_CHAT_ID || null;
+const FEEDBACK_LOG_CHAT_ID = process.env.FEEDBACK_LOG_CHAT_ID || null;
 const SERVER_URL = process.env.SERVER_URL || null;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 const SUPER_ADMIN_KEY = process.env.SUPER_ADMIN_KEY || null;
 const REPORT_LOGO_PATH = process.env.REPORT_LOGO_PATH || './logo.jpg';
 const REPORT_LOGOTAG = process.env.REPORT_LOGOTAG || 'Skillforge Principal Bot';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com';
+const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini';
+const OPENAI_MOD_MODEL = process.env.OPENAI_MOD_MODEL || 'omni-moderation-latest';
+const LINK_ALLOWLIST = new Set(
+    String(process.env.LINK_ALLOWLIST || '')
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean)
+);
 const CLASS_TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const EXCLUDED_SYSTEM_USER_IDS = new Set(['1087968824', '777000']);
 const EXCLUDED_SYSTEM_USERNAMES = new Set(['groupanonymousbot', 'telegram']);
@@ -108,6 +121,10 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
     if (typeof bot.telegram.kickChatMember === 'function') {
         const originalKick = bot.telegram.kickChatMember.bind(bot.telegram);
         bot.telegram.kickChatMember = (chatId, userId, extra) => telegramLimiter(() => withTelegramRetry(() => originalKick(chatId, userId, extra)));
+    }
+    if (typeof bot.telegram.unbanChatMember === 'function') {
+        const originalUnban = bot.telegram.unbanChatMember.bind(bot.telegram);
+        bot.telegram.unbanChatMember = (chatId, userId, extra) => telegramLimiter(() => withTelegramRetry(() => originalUnban(chatId, userId, extra)));
     }
 }
 
@@ -417,6 +434,221 @@ const reportError = async (message, error) => {
             console.error('Failed to send error report:', err.message);
         }
     }
+};
+
+const sendLogMessage = async (chatId, text, extra = {}) => {
+    if (!chatId) return;
+    try {
+        await bot.telegram.sendMessage(chatId, String(text || ''), extra);
+    } catch {}
+};
+
+const openaiRequestJson = async (pathname, payload) => {
+    if (!OPENAI_API_KEY) return { ok: false, error: 'missing OPENAI_API_KEY' };
+    return await new Promise((resolve) => {
+        let url;
+        try {
+            url = new URL(String(pathname || ''), OPENAI_BASE_URL);
+        } catch {
+            resolve({ ok: false, error: 'bad url' });
+            return;
+        }
+
+        const body = Buffer.from(JSON.stringify(payload || {}));
+        const req = https.request(url, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+                'Content-Type': 'application/json',
+                'Content-Length': String(body.length)
+            }
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (d) => chunks.push(d));
+            res.on('end', () => {
+                const raw = Buffer.concat(chunks).toString('utf-8');
+                try {
+                    const parsed = JSON.parse(raw || '{}');
+                    if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                        resolve({ ok: true, data: parsed });
+                        return;
+                    }
+                    resolve({ ok: false, error: parsed?.error?.message || `http ${res.statusCode}`, data: parsed });
+                } catch {
+                    resolve({ ok: false, error: `http ${res.statusCode}`, raw });
+                }
+            });
+        });
+
+        req.on('error', (err) => resolve({ ok: false, error: err?.message || String(err) }));
+        req.setTimeout(12_000, () => {
+            try { req.destroy(new Error('timeout')); } catch {}
+        });
+        req.write(body);
+        req.end();
+    });
+};
+
+const openaiModerateText = async (text) => {
+    const input = String(text || '').trim();
+    if (!input) return { ok: true, flagged: false, categories: {}, category_scores: {} };
+    const res = await openaiRequestJson('/v1/moderations', { model: OPENAI_MOD_MODEL, input });
+    if (!res.ok) return { ok: false, error: res.error };
+    const result = res.data?.results?.[0] || {};
+    return {
+        ok: true,
+        flagged: Boolean(result.flagged),
+        categories: result.categories || {},
+        category_scores: result.category_scores || {}
+    };
+};
+
+const openaiChatReply = async (messages, options = {}) => {
+    const res = await openaiRequestJson('/v1/chat/completions', {
+        model: OPENAI_CHAT_MODEL,
+        messages: Array.isArray(messages) ? messages : [],
+        temperature: Number.isFinite(Number(options.temperature)) ? Number(options.temperature) : 0.4,
+        max_tokens: Number.isFinite(Number(options.max_tokens)) ? Number(options.max_tokens) : 250
+    });
+    if (!res.ok) return { ok: false, error: res.error };
+    const content = res.data?.choices?.[0]?.message?.content;
+    return { ok: true, content: String(content || '').trim() };
+};
+
+const aiReplyCooldown = new Map();
+const shouldReplyWithAiNow = (key, cooldownMs = 10_000) => {
+    const k = String(key || '');
+    if (!k) return false;
+    const now = Date.now();
+    const last = aiReplyCooldown.get(k) || 0;
+    if (now - last < cooldownMs) return false;
+    aiReplyCooldown.set(k, now);
+    return true;
+};
+
+const BAD_WORD_PATTERNS = [
+    /\bfuck\b/i,
+    /\bshit\b/i,
+    /\bbitch\b/i,
+    /\basshole\b/i,
+    /\bbastard\b/i,
+    /\bdumb\b/i,
+    /\bidiot\b/i,
+    /\bstupid\b/i
+];
+
+const ADVERT_PATTERNS = [
+    /\bearn\b/i,
+    /\bmake money\b/i,
+    /\binvest\b/i,
+    /\bforex\b/i,
+    /\bcrypto\b/i,
+    /\bbet\b/i,
+    /\bloan\b/i,
+    /\bgiveaway\b/i,
+    /\bpromo\b/i,
+    /\bjoin my\b/i,
+    /\bwhatsapp\b/i,
+    /\btelegram\b/i
+];
+
+const extractUrls = (text) => {
+    const src = String(text || '');
+    const matches = src.match(/(https?:\/\/[^\s]+|www\.[^\s]+|t\.me\/[^\s]+)/gi) || [];
+    return matches.map((m) => m.replace(/[)\],.!?;:'"]+$/g, ''));
+};
+
+const getUrlHostname = (rawUrl) => {
+    const input = String(rawUrl || '').trim();
+    if (!input) return null;
+    try {
+        const url = new URL(input.startsWith('http') ? input : `https://${input}`);
+        return String(url.hostname || '').toLowerCase();
+    } catch {
+        return null;
+    }
+};
+
+const textHasBadWords = (text) => {
+    const src = String(text || '');
+    return BAD_WORD_PATTERNS.some((re) => re.test(src));
+};
+
+const textLooksLikeAdvert = (text) => {
+    const src = String(text || '');
+    return ADVERT_PATTERNS.some((re) => re.test(src));
+};
+
+const textHasDisallowedLinks = async (groupId, text) => {
+    const urls = extractUrls(text);
+    if (!urls.length) return { blocked: false, urls: [] };
+    if (!LINK_ALLOWLIST.size) return { blocked: false, urls };
+    const settings = await getGroupSettings(groupId);
+    const groupAllow = new Set(
+        String(settings?.link_allowlist || '')
+            .split(',')
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean)
+    );
+    const allow = groupAllow.size ? groupAllow : LINK_ALLOWLIST;
+    const blocked = [];
+    for (const u of urls) {
+        const host = getUrlHostname(u);
+        if (!host) continue;
+        const ok = allow.has(host) || Array.from(allow).some((d) => host === d || host.endsWith(`.${d}`));
+        if (!ok) blocked.push(u);
+    }
+    return { blocked: blocked.length > 0, urls, blocked_urls: blocked };
+};
+
+const moderationDocId = (groupId, userId) => `${String(groupId)}_${String(userId)}`;
+
+const loadModerationState = async (groupId, userId) => {
+    const doc = await db.collection('moderation_state').doc(moderationDocId(groupId, userId)).get();
+    return doc.exists ? (doc.data() || {}) : {};
+};
+
+const updateModerationState = async (groupId, userId, updates) => {
+    await db.collection('moderation_state').doc(moderationDocId(groupId, userId)).set({
+        group_id: String(groupId),
+        user_id: String(userId),
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+        ...updates
+    }, { merge: true });
+};
+
+const logModeration = async (payload) => {
+    const groupId = payload?.group_id ? String(payload.group_id) : '';
+    const groupName = payload?.group_name ? String(payload.group_name) : groupId;
+    const userId = payload?.user_id ? String(payload.user_id) : '';
+    const userLabel = payload?.user_label ? String(payload.user_label) : userId;
+    const action = payload?.action ? String(payload.action) : '';
+    const reason = payload?.reason ? String(payload.reason) : '';
+    const text = payload?.text ? String(payload.text) : '';
+    const snippet = text.length > 400 ? `${text.slice(0, 400)}...` : text;
+    const when = new Date().toISOString();
+    const msg = `🛡️ <b>Moderation</b>\nGroup: <b>${escapeHtml(groupName)}</b>\nUser: ${buildUserMentionHtml(userId, userLabel)}\nAction: <b>${escapeHtml(action)}</b>\nReason: <b>${escapeHtml(reason)}</b>\nAt: <b>${escapeHtml(when)}</b>\n\n${escapeHtml(snippet || '[no text]')}`;
+    await sendLogMessage(MOD_LOG_CHAT_ID, msg, { parse_mode: 'HTML' });
+};
+
+const logFeedback = async (payload) => {
+    const groupId = payload?.group_id ? String(payload.group_id) : '';
+    const groupName = payload?.group_name ? String(payload.group_name) : groupId;
+    const userId = payload?.user_id ? String(payload.user_id) : '';
+    const userLabel = payload?.user_label ? String(payload.user_label) : userId;
+    const text = payload?.text ? String(payload.text) : '';
+    const snippet = text.length > 1000 ? `${text.slice(0, 1000)}...` : text;
+    const when = new Date().toISOString();
+    let ai = '';
+    if (OPENAI_API_KEY) {
+        const r = await openaiChatReply([
+            { role: 'system', content: `You are ${REPORT_LOGOTAG}. Summarize the feedback and suggest a short professional reply. Do not include sensitive personal data.` },
+            { role: 'user', content: snippet }
+        ], { max_tokens: 220, temperature: 0.3 });
+        if (r.ok && r.content) ai = r.content;
+    }
+    const msg = `📝 <b>Feedback</b>\nGroup: <b>${escapeHtml(groupName || 'DM')}</b>\nFrom: ${buildUserMentionHtml(userId, userLabel)}\nAt: <b>${escapeHtml(when)}</b>\n\n${escapeHtml(snippet || '[no text]')}${ai ? `\n\n<b>AI summary + suggested reply</b>\n${escapeHtml(ai)}` : ''}`;
+    await sendLogMessage(FEEDBACK_LOG_CHAT_ID, msg, { parse_mode: 'HTML' });
 };
 
 const getLagosDateString = (date = new Date()) => {
@@ -2003,10 +2235,146 @@ bot.on('message', async (ctx, next) => {
     try {
         const chatType = ctx.chat?.type;
         if (chatType && (chatType === 'group' || chatType === 'supergroup')) {
+            const groupId = ctx.chat.id.toString();
+            const userId = ctx.from?.id ? String(ctx.from.id) : null;
+            if (userId && ctx.from && shouldTrackUser(ctx.from)) {
+                const bypassAdmins = await getBypassAdminIdSet(groupId);
+                const isBypassed = bypassAdmins.has(userId);
+
+                const replyToMessageId = ctx.message?.reply_to_message?.message_id ? String(ctx.message.reply_to_message.message_id) : null;
+                if (replyToMessageId) {
+                    const fbDocId = `${groupId}_${userId}`;
+                    const fbPendingDoc = await db.collection('feedback_pending').doc(fbDocId).get();
+                    if (fbPendingDoc.exists) {
+                        const pending = fbPendingDoc.data() || {};
+                        if (String(pending.prompt_message_id || '') === replyToMessageId) {
+                            const roomDoc = await db.collection('classrooms').doc(groupId).get();
+                            const groupName = roomDoc.exists ? String(roomDoc.data()?.group_name || ctx.chat?.title || groupId) : String(ctx.chat?.title || groupId);
+                            const text = String(ctx.message?.text || ctx.message?.caption || '').trim();
+                            await db.collection('general_feedback').add({
+                                group_id: groupId,
+                                group_name: groupName,
+                                user_id: userId,
+                                feedback: text,
+                                source: 'group',
+                                created_at: admin.firestore.FieldValue.serverTimestamp()
+                            });
+                            const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : userId);
+                            await logFeedback({ group_id: groupId, group_name: groupName, user_id: userId, user_label: label, text });
+                            await db.collection('feedback_pending').doc(fbDocId).delete().catch(() => {});
+                            await ctx.telegram.deleteMessage(groupId, ctx.message.message_id).catch(() => {});
+                            await ctx.telegram.deleteMessage(groupId, Number(replyToMessageId)).catch(() => {});
+                            await ctx.telegram.sendMessage(groupId, `✅ ${buildUserMentionHtml(userId, label)} feedback received. Thank you.`, { parse_mode: 'HTML' }).catch(() => {});
+                            return;
+                        }
+                    }
+                }
+
+                if (!isBypassed) {
+                    const entities = ctx.message?.entities || [];
+                    const isCommand = entities.some((e) => e.type === 'bot_command' && e.offset === 0);
+                    const text = String(ctx.message?.text || ctx.message?.caption || '').trim();
+                    if (!isCommand && text) {
+                        const disallowedLinks = await textHasDisallowedLinks(groupId, text);
+                        const badWords = textHasBadWords(text);
+                        let reason = null;
+                        if (badWords) {
+                            reason = 'profanity/insult';
+                        } else if (textLooksLikeAdvert(text) && extractUrls(text).length) {
+                            reason = 'advert/spam';
+                        } else if (disallowedLinks.blocked) {
+                            reason = 'disallowed link';
+                        } else if (OPENAI_API_KEY) {
+                            const m = await openaiModerateText(text);
+                            if (m.ok && m.flagged) reason = 'abuse/harassment';
+                        }
+
+                        if (reason) {
+                            try {
+                                await ctx.telegram.deleteMessage(groupId, ctx.message.message_id);
+                            } catch {}
+
+                            const state = await loadModerationState(groupId, userId);
+                            const strikes = Number(state?.strikes || 0);
+                            const kicks = Number(state?.kicks || 0);
+                            const bans = Number(state?.bans || 0);
+                            const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : userId);
+                            const groupName = String(ctx.chat?.title || groupId);
+
+                            let action = 'warn';
+                            if (bans > 0) {
+                                action = 'ban';
+                            } else if (kicks >= 1) {
+                                action = 'ban';
+                            } else if (strikes === 0) {
+                                action = 'warn';
+                            } else if (strikes === 1) {
+                                action = 'timeout';
+                            } else {
+                                action = 'kick';
+                            }
+
+                            const nowSec = Math.floor(Date.now() / 1000);
+                            if (action === 'warn') {
+                                await ctx.telegram.sendMessage(groupId, `⚠️ ${buildUserMentionHtml(userId, label)} warning: please stop abusive language / adverts. Next offense = timeout.`, { parse_mode: 'HTML' }).catch(() => {});
+                                await updateModerationState(groupId, userId, {
+                                    strikes: strikes + 1,
+                                    last_reason: reason,
+                                    last_action: 'warn',
+                                    last_message: text
+                                });
+                            } else if (action === 'timeout') {
+                                const until = nowSec + 60 * 60;
+                                await ctx.telegram.restrictChatMember(groupId, userId, { permissions: { can_send_messages: false }, until_date: until }).catch(() => {});
+                                await ctx.telegram.sendMessage(groupId, `⏳ ${buildUserMentionHtml(userId, label)} has been timed out for 1 hour. Next offense = kick.`, { parse_mode: 'HTML' }).catch(() => {});
+                                await updateModerationState(groupId, userId, {
+                                    strikes: strikes + 1,
+                                    timeouts: Number(state?.timeouts || 0) + 1,
+                                    last_reason: reason,
+                                    last_action: 'timeout',
+                                    last_message: text
+                                });
+                            } else if (action === 'kick') {
+                                await ctx.telegram.kickChatMember(groupId, userId).catch(() => {});
+                                await ctx.telegram.unbanChatMember(groupId, userId).catch(() => {});
+                                await ctx.telegram.sendMessage(groupId, `🚫 ${buildUserMentionHtml(userId, label)} has been kicked. Next offense = ban.`, { parse_mode: 'HTML' }).catch(() => {});
+                                await updateModerationState(groupId, userId, {
+                                    strikes: strikes + 1,
+                                    kicks: Number(state?.kicks || 0) + 1,
+                                    last_reason: reason,
+                                    last_action: 'kick',
+                                    last_message: text
+                                });
+                            } else {
+                                await ctx.telegram.kickChatMember(groupId, userId).catch(() => {});
+                                await ctx.telegram.sendMessage(groupId, `⛔️ ${buildUserMentionHtml(userId, label)} has been banned for repeated violations.`, { parse_mode: 'HTML' }).catch(() => {});
+                                await updateModerationState(groupId, userId, {
+                                    strikes: strikes + 1,
+                                    bans: Number(state?.bans || 0) + 1,
+                                    last_reason: reason,
+                                    last_action: 'ban',
+                                    last_message: text
+                                });
+                            }
+
+                            await logModeration({
+                                group_id: groupId,
+                                group_name: groupName,
+                                user_id: userId,
+                                user_label: label,
+                                action,
+                                reason,
+                                text
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+
             const entities = ctx.message?.entities || [];
             const isCommand = entities.some((e) => e.type === 'bot_command' && e.offset === 0);
             if (isCommand) {
-                const groupId = ctx.chat.id.toString();
                 const userId = ctx.from?.id ? ctx.from.id.toString() : null;
                 if (userId && !ctx.from.is_bot) {
                     const specialistDoc = await db.collection('specialists').doc(userId).get();
@@ -2031,11 +2399,12 @@ bot.on('message', async (ctx, next) => {
             }
 
             const replyToMessageId = ctx.message?.reply_to_message?.message_id ? String(ctx.message.reply_to_message.message_id) : null;
+            let handledAnnouncementReply = false;
             if (replyToMessageId && ctx.from && shouldTrackUser(ctx.from)) {
-                const groupId = String(ctx.chat.id);
                 const mapDocId = `${groupId}_${replyToMessageId}`;
                 const mapDoc = await db.collection('announcement_messages').doc(mapDocId).get();
                 if (mapDoc.exists) {
+                    handledAnnouncementReply = true;
                     const map = mapDoc.data() || {};
                     const announcerId = String(map.announcer_id || '');
                     const announcementId = String(map.announcement_id || '');
@@ -2064,6 +2433,30 @@ bot.on('message', async (ctx, next) => {
                             parse_mode: 'HTML',
                             ...Markup.inlineKeyboard([[Markup.button.callback('Reply', `thread_reply_${threadId}`)]])
                         });
+                    }
+                }
+            }
+            if (!handledAnnouncementReply && OPENAI_API_KEY) {
+                const text = String(ctx.message?.text || '').trim();
+                if (text) {
+                    const botMention = `@${BOT_USERNAME_SAFE}`;
+                    const hasMention = text.includes(botMention);
+                    const replyTo = ctx.message?.reply_to_message;
+                    const replyToBot = replyTo?.from?.username ? String(replyTo.from.username).replace(/^@/, '') === BOT_USERNAME_SAFE : false;
+                    if (hasMention || replyToBot) {
+                        if (!shouldReplyWithAiNow(`group:${groupId}`, 12_000)) return;
+                        const cleaned = text.replaceAll(botMention, '').trim();
+                        const userLabel = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : String(ctx.from.id));
+                        const groupName = String(ctx.chat?.title || groupId);
+                        const prompt = `Group: ${groupName}\nUser: ${userLabel}\nMessage: ${cleaned || text}`;
+                        const r = await openaiChatReply([
+                            { role: 'system', content: `You are ${REPORT_LOGOTAG}, the official Skillforge assistant inside Telegram. Be brief, helpful, and professional. If the user is asking for support, give actionable steps. Do not mention internal policies or secrets.` },
+                            { role: 'user', content: prompt }
+                        ], { max_tokens: 200, temperature: 0.4 });
+                        if (r.ok && r.content) {
+                            await ctx.reply(r.content).catch(() => {});
+                            return;
+                        }
                     }
                 }
             }
@@ -2157,6 +2550,23 @@ bot.on('text', async (ctx, next) => {
     }
 
     try {
+        const fbSessDoc = await db.collection('feedback_sessions').doc(userId).get();
+        if (fbSessDoc.exists && String(fbSessDoc.data()?.status || '') === 'awaiting_feedback') {
+            await db.collection('general_feedback').add({
+                group_id: null,
+                group_name: null,
+                user_id: userId,
+                feedback: String(messageText || '').trim(),
+                source: 'dm',
+                created_at: admin.firestore.FieldValue.serverTimestamp()
+            });
+            const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : userId);
+            await logFeedback({ group_id: null, group_name: null, user_id: userId, user_label: label, text: messageText });
+            await db.collection('feedback_sessions').doc(userId).delete().catch(() => {});
+            await ctx.reply('✅ Feedback received. Thank you.');
+            return;
+        }
+
         const replySessionDoc = await db.collection('announcement_reply_sessions').doc(userId).get();
         if (replySessionDoc.exists) {
             const sess = replySessionDoc.data() || {};
@@ -2454,7 +2864,24 @@ bot.on('text', async (ctx, next) => {
                 feedback: messageText,
                 timestamp: admin.firestore.FieldValue.serverTimestamp()
             });
+            const groupId = String(bestClass.data?.group_id || '');
+            const groupName = String(bestClass.data?.group_name || groupId);
+            const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : userId);
+            await logFeedback({ group_id: groupId, group_name: groupName, user_id: userId, user_label: label, text: messageText });
             ctx.reply('âœ… Thank you for your feedback!');
+            return;
+        }
+    }
+
+    if (OPENAI_API_KEY) {
+        if (!shouldReplyWithAiNow(`dm:${userId}`, 8_000)) return next();
+        const label = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : userId);
+        const r = await openaiChatReply([
+            { role: 'system', content: `You are ${REPORT_LOGOTAG}, the official Skillforge assistant. Be helpful, brief, and professional.` },
+            { role: 'user', content: `User: ${label}\nMessage: ${String(messageText || '').trim()}` }
+        ], { max_tokens: 220, temperature: 0.5 });
+        if (r.ok && r.content) {
+            await ctx.reply(r.content).catch(() => {});
             return;
         }
     }
@@ -3445,6 +3872,67 @@ bot.action(/^roster_(.+)$/, async (ctx) => {
     } finally {
         try { await ctx.answerCbQuery(); } catch {}
     }
+});
+
+bot.command('feedback', async (ctx) => {
+    const userId = ctx.from?.id ? String(ctx.from.id) : null;
+    if (!userId) return;
+    const msgText = String(ctx.message?.text || '');
+    const parts = msgText.trim().split(/\s+/);
+    const inline = parts.length > 1 ? msgText.slice(msgText.indexOf(' ') + 1).trim() : '';
+    const userLabel = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name ? String(ctx.from.first_name) : userId);
+
+    if (ctx.chat?.type === 'private') {
+        if (inline) {
+            await db.collection('general_feedback').add({
+                group_id: null,
+                group_name: null,
+                user_id: userId,
+                feedback: inline,
+                source: 'dm',
+                created_at: admin.firestore.FieldValue.serverTimestamp()
+            });
+            await logFeedback({ group_id: null, group_name: null, user_id: userId, user_label: userLabel, text: inline });
+            await ctx.reply('✅ Feedback received. Thank you.');
+            return;
+        }
+        await db.collection('feedback_sessions').doc(userId).set({
+            user_id: userId,
+            status: 'awaiting_feedback',
+            created_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        await ctx.reply('Send your feedback now (your next message will be saved).');
+        return;
+    }
+
+    const groupId = String(ctx.chat.id);
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    const groupName = roomDoc.exists ? String(roomDoc.data()?.group_name || ctx.chat?.title || groupId) : String(ctx.chat?.title || groupId);
+
+    if (inline) {
+        await db.collection('general_feedback').add({
+            group_id: groupId,
+            group_name: groupName,
+            user_id: userId,
+            feedback: inline,
+            source: 'group',
+            created_at: admin.firestore.FieldValue.serverTimestamp()
+        });
+        await logFeedback({ group_id: groupId, group_name: groupName, user_id: userId, user_label: userLabel, text: inline });
+        await ctx.telegram.deleteMessage(groupId, ctx.message.message_id).catch(() => {});
+        await ctx.telegram.sendMessage(groupId, `✅ ${buildUserMentionHtml(userId, userLabel)} feedback received. Thank you.`, { parse_mode: 'HTML' }).catch(() => {});
+        return;
+    }
+
+    const prompt = await ctx.reply(`Reply to this message with your feedback.`, { reply_markup: { force_reply: true } }).catch(() => null);
+    if (!prompt?.message_id) return;
+    await db.collection('feedback_pending').doc(`${groupId}_${userId}`).set({
+        group_id: groupId,
+        group_name: groupName,
+        user_id: userId,
+        prompt_message_id: String(prompt.message_id),
+        created_at: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 });
 
 bot.command('recount', async (ctx) => {
