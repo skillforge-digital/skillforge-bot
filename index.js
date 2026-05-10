@@ -1734,6 +1734,12 @@ bot.action(/^review_start_(.+)$/, async (ctx) => {
             updated_at: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
+        await db.collection('questionnaire_active').doc(specialistId).set({
+            user_id: specialistId,
+            session_id: String(sessionId),
+            updated_at: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
         await ctx.reply(`Question 1 of ${REVIEW_QUESTIONS.length}: ${REVIEW_QUESTIONS[0]}`);
         return ctx.answerCbQuery();
     } catch (error) {
@@ -2126,16 +2132,44 @@ bot.on('text', async (ctx, next) => {
         }
     } catch {}
 
-    const activeSessionSnapshot = await db.collection('questionnaire_sessions')
-        .where('user_id', '==', userId)
-        .where('status', '==', 'in_progress')
-        .orderBy('created_at', 'desc')
-        .limit(1)
-        .get();
+    let activeSessionId = null;
+    try {
+        const activeDoc = await db.collection('questionnaire_active').doc(userId).get();
+        if (activeDoc.exists) {
+            const sid = activeDoc.data()?.session_id;
+            if (sid) activeSessionId = String(sid);
+        }
+    } catch {}
 
-    if (!activeSessionSnapshot.empty) {
-        const sessionId = activeSessionSnapshot.docs[0].id;
-        const session = activeSessionSnapshot.docs[0].data();
+    let activeSessionDoc = null;
+    if (activeSessionId) {
+        const doc = await db.collection('questionnaire_sessions').doc(activeSessionId).get();
+        if (doc.exists && doc.data()?.status === 'in_progress') {
+            activeSessionDoc = doc;
+        } else {
+            await db.collection('questionnaire_active').doc(userId).delete().catch(() => {});
+        }
+    }
+
+    if (!activeSessionDoc) {
+        const activeSessionSnapshot = await db.collection('questionnaire_sessions')
+            .where('user_id', '==', userId)
+            .where('status', '==', 'in_progress')
+            .limit(1)
+            .get();
+        if (!activeSessionSnapshot.empty) {
+            activeSessionDoc = activeSessionSnapshot.docs[0];
+            await db.collection('questionnaire_active').doc(userId).set({
+                user_id: userId,
+                session_id: String(activeSessionDoc.id),
+                updated_at: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        }
+    }
+
+    if (activeSessionDoc) {
+        const sessionId = activeSessionDoc.id;
+        const session = activeSessionDoc.data();
         const step = session.current_step || 0;
         const answers = session.answers || [];
         answers[step] = messageText;
@@ -2177,6 +2211,7 @@ bot.on('text', async (ctx, next) => {
         };
 
         await sessionRef.update(completedPayload);
+        await db.collection('questionnaire_active').doc(userId).delete().catch(() => {});
 
         const completedSession = { id: sessionId, ...session, ...completedPayload };
         const pdfBuffer = await buildReviewPdf(completedSession);
