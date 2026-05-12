@@ -1960,11 +1960,40 @@ bot.command('setprogram', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return;
 
     const args = ctx.message.text.split(' ').slice(1);
-    if (args.length < 2) {
-        return ctx.reply('Usage: /setprogram <group_id> <YYYY-MM-DD>\nExample: /setprogram -100123456 2026-05-05');
+    const specialistId = ctx.from.id.toString();
+    let groupId;
+    let startDateStr;
+
+    if (args.length === 1) {
+        startDateStr = args[0];
+        const startDate = parseDateString(startDateStr);
+        if (!startDate) {
+            return ctx.reply('Usage: /setprogram <YYYY-MM-DD>\nExample: /setprogram 2026-05-05\n\nOr: /setprogram <group_id> <YYYY-MM-DD>');
+        }
+
+        const groupsSnapshot = await db.collection('classrooms')
+            .where('specialist_id', '==', specialistId)
+            .get();
+        if (groupsSnapshot.empty) {
+            return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+        }
+        if (groupsSnapshot.size === 1) {
+            groupId = groupsSnapshot.docs[0].id;
+        } else {
+            const buttons = groupsSnapshot.docs.map((doc) => {
+                const room = doc.data() || {};
+                return [Markup.button.callback(`${room.group_name || doc.id}`, `setprogram_pick_${doc.id}_${startDateStr}`)];
+            });
+            await ctx.reply('Select a group to set the program date:', Markup.inlineKeyboard(buttons));
+            return;
+        }
+    } else if (args.length >= 2) {
+        groupId = args[0];
+        startDateStr = args[1];
+    } else {
+        return ctx.reply('Usage: /setprogram <YYYY-MM-DD>\nExample: /setprogram 2026-05-05\n\nOr: /setprogram <group_id> <YYYY-MM-DD>');
     }
 
-    const [groupId, startDateStr] = args;
     const startDate = parseDateString(startDateStr);
     if (!startDate) {
         return ctx.reply('Invalid date format. Use YYYY-MM-DD.');
@@ -1976,7 +2005,6 @@ bot.command('setprogram', async (ctx) => {
     }
 
     const room = roomDoc.data();
-    const specialistId = ctx.from.id.toString();
     if (specialistId !== room.specialist_id) {
         return ctx.reply('Only the linked Specialist can set the course program.');
     }
@@ -2001,13 +2029,68 @@ bot.command('setprogram', async (ctx) => {
     ctx.reply(`âœ… Course program saved for **${room.group_name}**.\nStart Date: ${dateToString(startDate)}\nEnd Date: ${dateToString(endDate)}\nExpected: ${sessionsPerWeek} sessions per week, ${expectedDurationMinutes} minutes each, for ${weeks} weeks.`);
 });
 
+bot.action(/^setprogram_pick_(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})$/, async (ctx) => {
+    try {
+        if (ctx.chat.type !== 'private') return ctx.answerCbQuery();
+        if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
+
+        const groupId = String(ctx.match[1]);
+        const startDateStr = String(ctx.match[2]);
+        const startDate = parseDateString(startDateStr);
+        if (!startDate) {
+            await ctx.reply('Invalid date format. Use YYYY-MM-DD.');
+            return ctx.answerCbQuery();
+        }
+
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('That group is not linked to a classroom yet.');
+            return ctx.answerCbQuery();
+        }
+
+        const room = roomDoc.data();
+        const specialistId = ctx.from.id.toString();
+        if (specialistId !== room.specialist_id) {
+            await ctx.reply('Only the linked Specialist can set the course program.');
+            return ctx.answerCbQuery();
+        }
+
+        const weeks = 3;
+        const sessionsPerWeek = 3;
+        const minDaysPerWeek = 2;
+        const expectedDurationMinutes = 45;
+        const endDate = new Date(startDate);
+        endDate.setUTCDate(endDate.getUTCDate() + (weeks * 7) - 1);
+
+        await db.collection('classrooms').doc(groupId).update({
+            course_start_date: dateToString(startDate),
+            course_end_date: dateToString(endDate),
+            course_weeks: weeks,
+            sessions_per_week: sessionsPerWeek,
+            min_days_per_week: minDaysPerWeek,
+            expected_duration_minutes: expectedDurationMinutes,
+            expected_total_sessions: weeks * sessionsPerWeek
+        });
+
+        await ctx.reply(`✅ Course program saved for **${room.group_name}**.\nStart Date: ${dateToString(startDate)}\nEnd Date: ${dateToString(endDate)}\nExpected: ${sessionsPerWeek} sessions per week, ${expectedDurationMinutes} minutes each, for ${weeks} weeks.`, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await reportError('setprogram_pick failed', error);
+        await ctx.reply('Unable to set program right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
 bot.command('courseprogress', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
     if (!(await requireSpecialist(ctx))) return;
 
     const args = ctx.message.text.split(' ').slice(1);
+    const specialistId = ctx.from.id.toString();
     if (args.length < 1) {
-        return ctx.reply('Usage: /courseprogress <group_id>');
+        const picked = await sendSpecialistGroupPicker(ctx, specialistId, 'Select a group to view course progress:', 'courseprogress_pick');
+        if (picked) return await runCourseProgress(ctx, picked.groupId);
+        return;
     }
 
     const groupId = args[0];
@@ -3290,12 +3373,50 @@ bot.command('setclass', async (ctx) => {
 bot.command('cancelclass', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return;
     try {
-        const args = ctx.message.text.split(' ');
-        const groupId = args[1];
-        const timeInput = args[2];
+        const specialistId = ctx.from.id.toString();
+        const args = ctx.message.text.split(' ').slice(1);
+        let groupId;
+        let timeInput;
 
-        if (!groupId) {
-            return ctx.reply("âŒ Format error. Please use: /cancelclass <group_id> [time]\nExample: /cancelclass -100123456 14:00");
+        if (args.length >= 1 && CLASS_TIME_REGEX.test(args[0])) {
+            timeInput = args[0];
+            const groupsSnapshot = await db.collection('classrooms')
+                .where('specialist_id', '==', specialistId)
+                .get();
+            if (groupsSnapshot.empty) {
+                return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+            }
+            if (groupsSnapshot.size === 1) {
+                groupId = groupsSnapshot.docs[0].id;
+            } else {
+                const token = timeInput || 'all';
+                const buttons = groupsSnapshot.docs.map((doc) => {
+                    const room = doc.data() || {};
+                    return [Markup.button.callback(`${room.group_name || doc.id}`, `cancelclass_pick_${doc.id}_${token}`)];
+                });
+                await ctx.reply('Select a group to cancel today’s class:', Markup.inlineKeyboard(buttons));
+                return;
+            }
+        } else if (args.length >= 1) {
+            groupId = args[0];
+            timeInput = args[1] || null;
+        } else {
+            const groupsSnapshot = await db.collection('classrooms')
+                .where('specialist_id', '==', specialistId)
+                .get();
+            if (groupsSnapshot.empty) {
+                return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+            }
+            if (groupsSnapshot.size === 1) {
+                groupId = groupsSnapshot.docs[0].id;
+            } else {
+                const buttons = groupsSnapshot.docs.map((doc) => {
+                    const room = doc.data() || {};
+                    return [Markup.button.callback(`${room.group_name || doc.id}`, `cancelclass_pick_${doc.id}_all`)];
+                });
+                await ctx.reply('Select a group to cancel today’s class:', Markup.inlineKeyboard(buttons));
+                return;
+            }
         }
 
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
@@ -3304,7 +3425,6 @@ bot.command('cancelclass', async (ctx) => {
         }
 
         const room = roomDoc.data();
-        const specialistId = ctx.from.id.toString();
         if (specialistId !== room.specialist_id) {
             return ctx.reply('âŒ Only the linked Specialist can cancel the class.');
         }
@@ -3347,15 +3467,103 @@ bot.command('cancelclass', async (ctx) => {
     }
 });
 
+bot.action(/^cancelclass_pick_(.+)_(all|([0-9]{2}:[0-9]{2}))$/, async (ctx) => {
+    try {
+        if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
+        const groupId = String(ctx.match[1]);
+        const token = String(ctx.match[2]);
+        const timeInput = token === 'all' ? null : token;
+
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('That group is not linked to a classroom.');
+            return ctx.answerCbQuery();
+        }
+        const room = roomDoc.data();
+        const specialistId = ctx.from.id.toString();
+        if (specialistId !== room.specialist_id) {
+            await ctx.reply('Only the linked Specialist can cancel the class.');
+            return ctx.answerCbQuery();
+        }
+
+        const todayStr = getLagosDateString();
+        let canceledCount = 0;
+
+        if (timeInput) {
+            if (!CLASS_TIME_REGEX.test(timeInput)) {
+                await ctx.reply('Time format should be HH:MM in 24-hour format.');
+                return ctx.answerCbQuery();
+            }
+            const classId = getClassDocId(groupId, todayStr, timeInput);
+            const classDoc = await db.collection('classes').doc(classId).get();
+            if (!classDoc.exists || classDoc.data().status !== 'active') {
+                await ctx.reply('No active class scheduled at that time.');
+                return ctx.answerCbQuery();
+            }
+            await db.collection('classes').doc(classId).update({ status: 'canceled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
+            canceledCount = 1;
+        } else {
+            const snapshot = await db.collection('classes')
+                .where('group_id', '==', groupId)
+                .where('date', '==', todayStr)
+                .where('status', '==', 'active')
+                .get();
+            if (snapshot.empty) {
+                await ctx.reply('No active classes scheduled for today to cancel.');
+                return ctx.answerCbQuery();
+            }
+            for (const classDoc of snapshot.docs) {
+                await db.collection('classes').doc(classDoc.id).update({ status: 'canceled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
+                canceledCount += 1;
+            }
+        }
+
+        const cancelMessage = `⚠️ The live session${timeInput ? ` at ${timeInput}` : ''} for **${room.group_name}** has been canceled.`;
+        await ctx.telegram.sendMessage(groupId, cancelMessage, { parse_mode: 'Markdown' }).catch(() => {});
+        await ctx.reply(`✅ Canceled ${canceledCount} scheduled class(es).`);
+    } catch (error) {
+        await reportError('cancelclass_pick failed', error);
+        await ctx.reply('Failed to cancel the class. Please try again.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
+    }
+});
+
 bot.command('rescheduleclass', async (ctx) => {
     try {
-        const args = ctx.message.text.split(' ');
-        const groupId = args[1];
-        const oldTime = args[2];
-        const newTime = args[3];
+        if (!(await requireSpecialist(ctx))) return;
+        const specialistId = ctx.from.id.toString();
+        const args = ctx.message.text.split(' ').slice(1);
+        let groupId;
+        let oldTime;
+        let newTime;
 
-        if (!groupId || !oldTime || !newTime) {
-            return ctx.reply('âŒ Format error. Please use: /rescheduleclass <group_id> <old_time> <new_time>\nExample: /rescheduleclass -100123456 14:00 15:00');
+        if (args.length >= 2 && CLASS_TIME_REGEX.test(args[0]) && CLASS_TIME_REGEX.test(args[1])) {
+            oldTime = args[0];
+            newTime = args[1];
+
+            const groupsSnapshot = await db.collection('classrooms')
+                .where('specialist_id', '==', specialistId)
+                .get();
+            if (groupsSnapshot.empty) {
+                return ctx.reply('You have no classroom groups linked yet. Use /claim in a group first.');
+            }
+            if (groupsSnapshot.size === 1) {
+                groupId = groupsSnapshot.docs[0].id;
+            } else {
+                const buttons = groupsSnapshot.docs.map((doc) => {
+                    const room = doc.data() || {};
+                    return [Markup.button.callback(`${room.group_name || doc.id}`, `rescheduleclass_pick_${doc.id}_${oldTime}_${newTime}`)];
+                });
+                await ctx.reply('Select a group to reschedule today’s class:', Markup.inlineKeyboard(buttons));
+                return;
+            }
+        } else if (args.length >= 3) {
+            groupId = args[0];
+            oldTime = args[1];
+            newTime = args[2];
+        } else {
+            return ctx.reply('❌ Format: /rescheduleclass <old_time> <new_time>\nExample: /rescheduleclass 14:00 15:00\n\nOr: /rescheduleclass <group_id> <old_time> <new_time>');
         }
 
         if (!CLASS_TIME_REGEX.test(oldTime) || !CLASS_TIME_REGEX.test(newTime)) {
@@ -3372,7 +3580,6 @@ bot.command('rescheduleclass', async (ctx) => {
         }
 
         const room = roomDoc.data();
-        const specialistId = ctx.from.id.toString();
         if (specialistId !== room.specialist_id) {
             return ctx.reply('âŒ Only the linked Specialist can reschedule this class.');
         }
@@ -3422,6 +3629,82 @@ bot.command('rescheduleclass', async (ctx) => {
     } catch (error) {
         await reportError('rescheduleclass command failed', error);
         ctx.reply('âŒ Failed to reschedule the class. Please try again.');
+    }
+});
+
+bot.action(/^rescheduleclass_pick_(.+)_([0-9]{2}:[0-9]{2})_([0-9]{2}:[0-9]{2})$/, async (ctx) => {
+    try {
+        if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
+        const groupId = String(ctx.match[1]);
+        const oldTime = String(ctx.match[2]);
+        const newTime = String(ctx.match[3]);
+        const specialistId = ctx.from.id.toString();
+
+        if (!CLASS_TIME_REGEX.test(oldTime) || !CLASS_TIME_REGEX.test(newTime)) {
+            await ctx.reply('Time format should be HH:MM in 24-hour format.');
+            return ctx.answerCbQuery();
+        }
+        if (oldTime === newTime) {
+            await ctx.reply('The new time must be different from the old time.');
+            return ctx.answerCbQuery();
+        }
+
+        const roomDoc = await db.collection('classrooms').doc(groupId).get();
+        if (!roomDoc.exists) {
+            await ctx.reply('That group is not linked to a classroom.');
+            return ctx.answerCbQuery();
+        }
+        const room = roomDoc.data();
+        if (specialistId !== room.specialist_id) {
+            await ctx.reply('Only the linked Specialist can reschedule this class.');
+            return ctx.answerCbQuery();
+        }
+
+        const todayStr = getLagosDateString();
+        const oldClassId = getClassDocId(groupId, todayStr, oldTime);
+        const oldClassDoc = await db.collection('classes').doc(oldClassId).get();
+        if (!oldClassDoc.exists || oldClassDoc.data().status !== 'active') {
+            await ctx.reply('No active class exists at the old time.');
+            return ctx.answerCbQuery();
+        }
+
+        const newClassId = getClassDocId(groupId, todayStr, newTime);
+        const existingNewClass = await db.collection('classes').doc(newClassId).get();
+        if (existingNewClass.exists && existingNewClass.data().status === 'active') {
+            await ctx.reply('A class is already scheduled at the new time.');
+            return ctx.answerCbQuery();
+        }
+
+        await db.collection('classes').doc(oldClassId).update({ status: 'rescheduled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
+        await db.collection('classes').doc(newClassId).set({
+            date: todayStr,
+            time: newTime,
+            topic: oldClassDoc.data().topic || null,
+            reminder_30_sent: false,
+            reminder_15_sent: false,
+            reminder_5_sent: false,
+            reminder_0_sent: false,
+            group_id: groupId,
+            specialist_id: room.specialist_id,
+            group_name: room.group_name,
+            status: 'active',
+            created_at: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        const announcementText = `🔄 **Class Rescheduled**\n\nThe live session for **${room.group_name}** has been moved from **${oldTime}** to **${newTime}** today.${oldClassDoc.data().topic ? `\n\n**Topic:** ${oldClassDoc.data().topic}` : ''}`;
+        const sentMessage = await ctx.telegram.sendMessage(groupId, announcementText, { parse_mode: 'Markdown' });
+        await ctx.telegram.pinChatMessage(groupId, sentMessage.message_id, { disable_notification: true }).catch(() => {});
+
+        await ctx.reply(`✅ Rescheduled class from ${oldTime} to ${newTime}.`);
+
+        const verifiedTrainees = await getVerifiedTraineeIds(groupId);
+        const reminderText = `🔄 The live session for **${room.group_name}** has been rescheduled to **${newTime}** today.${oldClassDoc.data().topic ? ` Topic: ${oldClassDoc.data().topic}` : ''}`;
+        await sendDmUsers(normalizeUserIds([room.specialist_id, ...verifiedTrainees]), reminderText, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await reportError('rescheduleclass_pick failed', error);
+        await ctx.reply('Failed to reschedule the class. Please try again.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
     }
 });
 
@@ -3695,9 +3978,6 @@ bot.on('my_chat_member', async (ctx) => {
 
 const handleVerification = async (ctx, groupIdHint = null) => {
     if (ctx.chat.type !== 'private') {
-        try {
-            await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message?.message_id);
-        } catch {}
         const groupId = ctx.chat?.id ? String(ctx.chat.id) : null;
         const link = groupId ? getVerifyLink(groupId) : getBotDirectMessageLink();
         try {
