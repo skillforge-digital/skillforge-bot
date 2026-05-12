@@ -54,6 +54,12 @@ A comprehensive Telegram bot for managing Skillforge Digital Academy's classroom
    - Enable Firestore.
    - Generate a service account key and set `FIREBASE_JSON` or use the local file.
 
+## Firestore Indexes
+
+The bot uses compound queries on `group_verifications` that may require a composite index:
+
+- `group_verifications`: `group_id` ASC, `verified` ASC, `removed` ASC
+
 5. **Run the bot**:
    ```bash
    npm start
@@ -66,7 +72,8 @@ The bot features a built-in commands menu in Telegram. When you type "/" in a ch
 ### Specialist Commands
 - `/register <password>` - Register as a specialist.
 - `/claim` - Link a group as a classroom.
-- `/setclass <group_id> <time> [topic]` - Schedule a class.
+- `/setclass <HH:MM> [topic]` - Schedule today’s class (auto-detects your group if you have one).
+- `/setclass <group_id> <HH:MM> [topic]` - Schedule today’s class for a specific group (if you manage multiple groups).
 - `/cancelclass <group_id> [time]` - Cancel classes.
 - `/rescheduleclass <group_id> <old_time> <new_time>` - Reschedule a class.
 - `/questionnaire [group_id]` - Start weekly questionnaire.
