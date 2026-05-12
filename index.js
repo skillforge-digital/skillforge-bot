@@ -2842,104 +2842,180 @@ bot.on('text', async (ctx, next) => {
     }
 
     if (activeSessionDoc) {
-        const sessionId = activeSessionDoc.id;
-        const session = activeSessionDoc.data();
-        const step = session.current_step || 0;
-        const answers = session.answers || [];
-        answers[step] = messageText;
+        try {
+            const sessionId = activeSessionDoc.id;
+            const session = activeSessionDoc.data();
+            const step = session.current_step || 0;
+            const answers = session.answers || [];
+            answers[step] = messageText;
 
-        const nextStep = step + 1;
-        const updatePayload = {
-            answers,
-            current_step: nextStep,
-            updated_at: admin.firestore.FieldValue.serverTimestamp()
-        };
+            const nextStep = step + 1;
+            const updatePayload = {
+                answers,
+                current_step: nextStep,
+                updated_at: admin.firestore.FieldValue.serverTimestamp()
+            };
 
-        if (nextStep < REVIEW_QUESTIONS.length) {
-            await db.collection('questionnaire_sessions').doc(sessionId).update(updatePayload);
-            await ctx.reply(`Question ${nextStep + 1} of ${REVIEW_QUESTIONS.length}: ${REVIEW_QUESTIONS[nextStep]}`);
+            if (nextStep < REVIEW_QUESTIONS.length) {
+                await db.collection('questionnaire_sessions').doc(sessionId).update(updatePayload);
+                await ctx.reply(`Question ${nextStep + 1} of ${REVIEW_QUESTIONS.length}: ${REVIEW_QUESTIONS[nextStep]}`);
+                return;
+            }
+
+            const sessionRef = db.collection('questionnaire_sessions').doc(sessionId);
+            const performance = await getWeekPerformance(
+                session.group_id,
+                parseDateString(session.week_start),
+                parseDateString(session.week_end),
+                {
+                    sessions_per_week: session.sessions_per_week,
+                    min_days_per_week: session.min_days_per_week
+                }
+            );
+
+            const ratingAnswer = answers[3] || '';
+            const ratingMatch = ratingAnswer.match(/\b([1-5])\b/);
+            const rating = ratingMatch ? Number(ratingMatch[1]) : null;
+
+            const completedPayload = {
+                ...updatePayload,
+                status: 'completed',
+                performance,
+                rating,
+                completed_at: admin.firestore.FieldValue.serverTimestamp()
+            };
+
+            await sessionRef.update(completedPayload);
+            await db.collection('questionnaire_active').doc(userId).delete().catch(() => {});
+
+            await ctx.reply('✅ Response received. Finalizing your weekly review now...');
+
+            const completedSession = { id: sessionId, ...session, ...completedPayload };
+            let pdfBuffer = null;
+            try {
+                pdfBuffer = await buildReviewPdf(completedSession);
+            } catch (error) {
+                await reportError('buildReviewPdf failed', error);
+            }
+
+            if (pdfBuffer) {
+                await ctx.replyWithDocument({ source: pdfBuffer, filename: `weekly_review_${session.group_name}_${session.week_start}_to_${session.week_end}.pdf` });
+                if (SERVER_URL) {
+                    await ctx.reply(`Download: ${SERVER_URL}/review/${sessionId}\nPrint: ${SERVER_URL}/review/${sessionId}/print\n\nSubmit the PDF to your head of units.`);
+                }
+            } else {
+                await ctx.reply('✅ Weekly review saved successfully. I could not generate the PDF right now. Please try /weeklyreport later.');
+            }
+            return;
+        } catch (error) {
+            await reportError('weekly review dm handler failed', error);
+            await ctx.reply('✅ Response received. I ran into an error finishing your weekly review. Please try /weeklyreport later.');
             return;
         }
-
-        const sessionRef = db.collection('questionnaire_sessions').doc(sessionId);
-        const performance = await getWeekPerformance(
-            session.group_id,
-            parseDateString(session.week_start),
-            parseDateString(session.week_end),
-            {
-                sessions_per_week: session.sessions_per_week,
-                min_days_per_week: session.min_days_per_week
-            }
-        );
-
-        const ratingAnswer = answers[3] || '';
-        const ratingMatch = ratingAnswer.match(/\b([1-5])\b/);
-        const rating = ratingMatch ? Number(ratingMatch[1]) : null;
-
-        const completedPayload = {
-            ...updatePayload,
-            status: 'completed',
-            performance,
-            rating,
-            completed_at: admin.firestore.FieldValue.serverTimestamp()
-        };
-
-        await sessionRef.update(completedPayload);
-        await db.collection('questionnaire_active').doc(userId).delete().catch(() => {});
-
-        const completedSession = { id: sessionId, ...session, ...completedPayload };
-        const pdfBuffer = await buildReviewPdf(completedSession);
-
-        await ctx.reply('✅ Weekly review completed and documented. Generating your PDF now...');
-        await ctx.replyWithDocument({ source: pdfBuffer, filename: `weekly_review_${session.group_name}_${session.week_start}_to_${session.week_end}.pdf` });
-        if (SERVER_URL) {
-            await ctx.reply(`Download: ${SERVER_URL}/review/${sessionId}\nPrint: ${SERVER_URL}/review/${sessionId}/print\n\nSubmit the PDF to your head of units.`);
-        }
-        return;
     }
 
-    const scheduleSessionDoc = await db.collection('schedule_sessions').doc(userId).get();
-    if (scheduleSessionDoc.exists && scheduleSessionDoc.data().status === 'awaiting_time') {
-        const scheduleSession = scheduleSessionDoc.data();
-        const expiresAt = scheduleSession.expires_at?.toDate ? scheduleSession.expires_at.toDate() : null;
-        if (expiresAt && expiresAt.getTime() <= Date.now()) {
-            await db.collection('schedule_sessions').doc(userId).update({
-                status: 'expired',
-                expired_at: admin.firestore.FieldValue.serverTimestamp()
-            });
-            await ctx.reply('Your scheduling session has expired. Please tap Yes again to start scheduling.');
-            return;
-        }
+    try {
+        const scheduleSessionDoc = await db.collection('schedule_sessions').doc(userId).get();
+        if (scheduleSessionDoc.exists) {
+            const scheduleSession = scheduleSessionDoc.data() || {};
+            const status = String(scheduleSession.status || '');
+            if (status === 'awaiting_time' || status === 'awaiting_topic') {
+                const expiresAt = scheduleSession.expires_at?.toDate ? scheduleSession.expires_at.toDate() : null;
+                if (expiresAt && expiresAt.getTime() <= Date.now()) {
+                    await db.collection('schedule_sessions').doc(userId).update({
+                        status: 'expired',
+                        expired_at: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    await ctx.reply('Your scheduling session has expired. Please tap Yes again to start scheduling.');
+                    return;
+                }
 
-        const [timeInput, ...topicParts] = messageText.trim().split(/\s+/);
-        if (!CLASS_TIME_REGEX.test(timeInput)) {
-            await ctx.reply('âŒ Time format should be HH:MM in 24-hour format. Example: 14:00 Introduction to JavaScript');
-            return;
-        }
+                const normalized = String(messageText || '').trim();
+                const lowered = normalized.toLowerCase();
+                if (lowered === 'cancel') {
+                    await db.collection('schedule_sessions').doc(userId).set({
+                        ...scheduleSession,
+                        status: 'canceled',
+                        canceled_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    await ctx.reply('✅ Scheduling canceled.');
+                    return;
+                }
 
-        const topic = topicParts.join(' ') || null;
-        try {
-            await scheduleLiveClass({
-                groupId: scheduleSession.group_id,
-                specialistId: userId,
-                timeInput,
-                topic,
-                dateStr: scheduleSession.date || null,
-                telegram: ctx.telegram,
-                reply: (text, extra) => ctx.reply(text, extra)
-            });
+                if (status === 'awaiting_time') {
+                    const [timeInput, ...topicParts] = normalized.split(/\s+/);
+                    if (!CLASS_TIME_REGEX.test(timeInput)) {
+                        await ctx.reply('❌ Time must be HH:MM (24-hour). Example: 19:30');
+                        return;
+                    }
 
-            await db.collection('schedule_sessions').doc(userId).set({
-                ...scheduleSession,
-                status: 'completed',
-                scheduled_time: timeInput,
-                topic,
-                completed_at: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        } catch (error) {
-            await reportError('Schedule session failed', error);
-            await ctx.reply('âŒ Failed to schedule the class. Please try again or tap Yes again to restart.');
+                    const topicInline = topicParts.join(' ') || null;
+                    if (topicInline) {
+                        await ctx.reply('✅ Received. Scheduling now...');
+                        await scheduleLiveClass({
+                            groupId: scheduleSession.group_id,
+                            specialistId: userId,
+                            timeInput,
+                            topic: topicInline,
+                            dateStr: scheduleSession.date || null,
+                            telegram: ctx.telegram,
+                            reply: (text, extra) => ctx.reply(text, extra)
+                        });
+
+                        await db.collection('schedule_sessions').doc(userId).set({
+                            ...scheduleSession,
+                            status: 'completed',
+                            scheduled_time: timeInput,
+                            topic: topicInline,
+                            completed_at: admin.firestore.FieldValue.serverTimestamp()
+                        }, { merge: true });
+                        return;
+                    }
+
+                    await db.collection('schedule_sessions').doc(userId).set({
+                        ...scheduleSession,
+                        status: 'awaiting_topic',
+                        scheduled_time: timeInput,
+                        updated_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+
+                    await ctx.reply('✅ Time received. Now send the topic (or reply with "skip").');
+                    return;
+                }
+
+                if (status === 'awaiting_topic') {
+                    const timeInput = String(scheduleSession.scheduled_time || '').trim();
+                    if (!CLASS_TIME_REGEX.test(timeInput)) {
+                        await ctx.reply('❌ I lost the time for this scheduling session. Please tap Yes again to restart scheduling.');
+                        return;
+                    }
+
+                    const topic = (lowered === 'skip' || lowered === 'none' || lowered === 'no' || lowered === '-') ? null : normalized;
+                    await ctx.reply('✅ Topic received. Scheduling now...');
+
+                    await scheduleLiveClass({
+                        groupId: scheduleSession.group_id,
+                        specialistId: userId,
+                        timeInput,
+                        topic,
+                        dateStr: scheduleSession.date || null,
+                        telegram: ctx.telegram,
+                        reply: (text, extra) => ctx.reply(text, extra)
+                    });
+
+                    await db.collection('schedule_sessions').doc(userId).set({
+                        ...scheduleSession,
+                        status: 'completed',
+                        topic,
+                        completed_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    return;
+                }
+            }
         }
+    } catch (error) {
+        await reportError('Schedule session handler failed', error);
+        await ctx.reply('❌ I could not process your scheduling message right now. Please try again.');
         return;
     }
 
@@ -3183,7 +3259,46 @@ const beginScheduleSession = async (ctx, groupId, dateStr = null) => {
     }, { merge: true });
 
     await ctx.reply(
-        `⏰ *Schedule Class for ${room.group_name}*\n\nSend the time in HH:MM format (24-hour) and an optional topic.\n\nExample:\n14:30 Introduction to Node.js`,
+        `⏰ *Schedule Class for ${room.group_name}*\n\nSend the time in HH:MM format (24-hour).\n\nExample:\n14:30`,
+        { parse_mode: 'Markdown' }
+    );
+    return true;
+};
+
+const beginScheduleTopicSession = async (ctx, groupId, dateStr, timeInput) => {
+    const specialistId = ctx.from.id.toString();
+    const roomDoc = await db.collection('classrooms').doc(groupId).get();
+    if (!roomDoc.exists) {
+        await ctx.reply('That group is not linked to a classroom yet.');
+        return false;
+    }
+
+    const room = roomDoc.data();
+    if (room.specialist_id !== specialistId) {
+        await ctx.reply('Only the linked Specialist can schedule this group.');
+        return false;
+    }
+
+    if (!CLASS_TIME_REGEX.test(String(timeInput || '').trim())) {
+        await ctx.reply('❌ Time must be HH:MM (24-hour). Example: 19:30');
+        return false;
+    }
+
+    const effectiveDate = dateStr || getLagosDateString();
+    const expiresAt = admin.firestore.Timestamp.fromDate(new Date(Date.now() + (2 * 60 * 60 * 1000)));
+    await db.collection('schedule_sessions').doc(specialistId).set({
+        specialist_id: specialistId,
+        group_id: groupId,
+        group_name: room.group_name,
+        date: effectiveDate,
+        status: 'awaiting_topic',
+        scheduled_time: String(timeInput).trim(),
+        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        expires_at: expiresAt
+    }, { merge: true });
+
+    await ctx.reply(
+        `✅ Time received: *${String(timeInput).trim()}*\n\nNow send the topic (or reply with "skip").`,
         { parse_mode: 'Markdown' }
     );
     return true;
@@ -3281,6 +3396,7 @@ const scheduleLiveClass = async ({ groupId, specialistId, timeInput, topic, date
         time: timeInput,
         topic: topic,
         reminder_30_sent: false,
+        reminder_10_sent: false,
         reminder_15_sent: false,
         reminder_5_sent: false,
         reminder_0_sent: false,
@@ -3293,7 +3409,7 @@ const scheduleLiveClass = async ({ groupId, specialistId, timeInput, topic, date
     });
 
     const topicText = topic ? `\n\n**Topic:** ${topic}` : '';
-    const announcementText = `📢 **Live Session Scheduled**\n\nA live session for **${room.group_name}** is confirmed at **${timeInput}** on ${todayStr}.${topicText}\n\nI will pin this announcement and send personal reminders to the Specialist and verified trainees at 30, 15, and 5 minutes before class.`;
+    const announcementText = `📢 **Live Session Scheduled**\n\nA live session for **${room.group_name}** is confirmed at **${timeInput}** on ${todayStr}.${topicText}\n\nI will pin this announcement and send personal reminders to the Specialist and verified trainees at 30, 15, 10, and 5 minutes before class.`;
     try {
         const sentMessage = await telegram.sendMessage(groupId, announcementText, { parse_mode: 'Markdown' });
         await telegram.pinChatMessage(groupId, sentMessage.message_id, { disable_notification: true });
@@ -3306,21 +3422,83 @@ const scheduleLiveClass = async ({ groupId, specialistId, timeInput, topic, date
     }
 
     const verifiedTrainees = await getVerifiedTraineeIds(groupId);
-    const reminderText = `✅ Live session for **${room.group_name}** is scheduled at **${timeInput}** on ${todayStr}.${topic ? ` Topic: ${topic}` : ''} I will remind you 30, 15, and 5 minutes before the class.`;
+    const reminderText = `✅ Live session for **${room.group_name}** is scheduled at **${timeInput}** on ${todayStr}.${topic ? ` Topic: ${topic}` : ''} I will remind you 30, 15, 10, and 5 minutes before the class.`;
     await sendDmUsers(normalizeUserIds([room.specialist_id, ...verifiedTrainees]), reminderText, { parse_mode: 'Markdown' });
 
     return { room, todayStr, classId };
 };
 
+const sendCancelClassPicker = async (ctx, groupId) => {
+    const specialistId = ctx.from.id.toString();
+    const roomDoc = await db.collection('classrooms').doc(String(groupId)).get();
+    if (!roomDoc.exists) {
+        await ctx.reply('That group is not linked to a classroom.');
+        return false;
+    }
+    const room = roomDoc.data() || {};
+    if (String(room.specialist_id || '') !== String(specialistId)) {
+        await ctx.reply('Only the linked Specialist can cancel classes for this group.');
+        return false;
+    }
+
+    const todayStr = getLagosDateString();
+    const snapshot = await db.collection('classes')
+        .where('group_id', '==', String(groupId))
+        .where('date', '==', todayStr)
+        .where('status', '==', 'active')
+        .get();
+
+    if (snapshot.empty) {
+        await ctx.reply(`No active classes found for **${room.group_name || groupId}** today.`, { parse_mode: 'Markdown' });
+        return true;
+    }
+
+    const items = snapshot.docs.map((d) => d.data()).filter(Boolean).sort((a, b) => String(a.time || '').localeCompare(String(b.time || '')));
+    const buttons = items.slice(0, 12).map((c) => {
+        const label = `${String(c.time || '').trim()}${c.topic ? ` — ${String(c.topic).trim().slice(0, 24)}` : ''}`;
+        return [Markup.button.callback(`Cancel ${label}`, `cancelclass_pick_${groupId}_${String(c.time || '').trim()}`)];
+    });
+    buttons.push([Markup.button.callback('Cancel all today', `cancelclass_pick_${groupId}_all`)]);
+
+    await ctx.reply(`Select which class to cancel for **${room.group_name || groupId}**:`, {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard(buttons)
+    });
+    return true;
+};
+
 bot.command('setclass', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return;
     try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /setclass in a private chat with the bot.');
+        }
+
         const specialistId = ctx.from.id.toString();
         const args = ctx.message.text.split(' ').slice(1);
 
         let groupId;
         let timeInput;
         let topic;
+
+        if (args.length === 0) {
+            const groupsSnapshot = await db.collection('classrooms')
+                .where('specialist_id', '==', specialistId)
+                .get();
+
+            if (groupsSnapshot.empty) {
+                return ctx.reply('❌ You have no claimed groups. Use /claim in a group first.');
+            }
+
+            if (groupsSnapshot.size === 1) {
+                groupId = groupsSnapshot.docs[0].id;
+                await beginScheduleSession(ctx, groupId);
+                return;
+            }
+
+            await sendScheduleGroupPicker(ctx, specialistId);
+            return;
+        }
 
         if (args.length >= 1 && CLASS_TIME_REGEX.test(args[0])) {
             timeInput = args[0];
@@ -3354,6 +3532,12 @@ bot.command('setclass', async (ctx) => {
             return ctx.reply('❌ Time must be HH:MM (24-hour). Example: 19:30');
         }
 
+        if (!topic) {
+            await beginScheduleTopicSession(ctx, groupId, null, timeInput);
+            return;
+        }
+
+        await ctx.reply('✅ Received. Scheduling now...');
         await scheduleLiveClass({
             groupId,
             specialistId,
@@ -3373,6 +3557,10 @@ bot.command('setclass', async (ctx) => {
 bot.command('cancelclass', async (ctx) => {
     if (!(await requireSpecialist(ctx))) return;
     try {
+        if (ctx.chat.type !== 'private') {
+            return ctx.reply('Please use /cancelclass in a private chat with the bot.');
+        }
+
         const specialistId = ctx.from.id.toString();
         const args = ctx.message.text.split(' ').slice(1);
         let groupId;
@@ -3412,58 +3600,62 @@ bot.command('cancelclass', async (ctx) => {
             } else {
                 const buttons = groupsSnapshot.docs.map((doc) => {
                     const room = doc.data() || {};
-                    return [Markup.button.callback(`${room.group_name || doc.id}`, `cancelclass_pick_${doc.id}_all`)];
+                    return [Markup.button.callback(`${room.group_name || doc.id}`, `cancelclass_group_${doc.id}`)];
                 });
                 await ctx.reply('Select a group to cancel today’s class:', Markup.inlineKeyboard(buttons));
                 return;
             }
         }
 
+        if (!groupId) return;
+
+        if (!timeInput) {
+            await sendCancelClassPicker(ctx, groupId);
+            return;
+        }
+
+        if (!CLASS_TIME_REGEX.test(timeInput)) {
+            return ctx.reply('❌ Time must be HH:MM (24-hour). Example: 19:30');
+        }
+
         const roomDoc = await db.collection('classrooms').doc(groupId).get();
         if (!roomDoc.exists) {
-            return ctx.reply('âŒ That group is not linked to a classroom.');
+            return ctx.reply('That group is not linked to a classroom.');
+        }
+        const room = roomDoc.data() || {};
+        if (String(room.specialist_id || '') !== String(specialistId)) {
+            return ctx.reply('Only the linked Specialist can cancel the class.');
         }
 
-        const room = roomDoc.data();
-        if (specialistId !== room.specialist_id) {
-            return ctx.reply('âŒ Only the linked Specialist can cancel the class.');
-        }
-
-        const todayStr = getLagosDateString();
-        let canceledCount = 0;
-
-        if (timeInput) {
-            if (!CLASS_TIME_REGEX.test(timeInput)) {
-                return ctx.reply('âŒ Time format should be HH:MM in 24-hour format.');
-            }
-            const classId = getClassDocId(groupId, todayStr, timeInput);
-            const classDoc = await db.collection('classes').doc(classId).get();
-            if (!classDoc.exists || classDoc.data().status !== 'active') {
-                return ctx.reply('âŒ No active class scheduled at that time.');
-            }
-            await db.collection('classes').doc(classId).update({ status: 'canceled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
-            canceledCount = 1;
-        } else {
-            const snapshot = await db.collection('classes')
-                .where('group_id', '==', groupId)
-                .where('date', '==', todayStr)
-                .where('status', '==', 'active')
-                .get();
-            if (snapshot.empty) {
-                return ctx.reply('âŒ No active classes scheduled for today to cancel.');
-            }
-            for (const classDoc of snapshot.docs) {
-                await db.collection('classes').doc(classDoc.id).update({ status: 'canceled', canceled_at: admin.firestore.FieldValue.serverTimestamp() });
-                canceledCount += 1;
-            }
-        }
-
-        const cancelMessage = `âš ï¸ The live session${timeInput ? ` at ${timeInput}` : ''} for **${room.group_name}** has been canceled.`;
-        await ctx.telegram.sendMessage(groupId, cancelMessage, { parse_mode: 'Markdown' });
-        ctx.reply(`âœ… Canceled ${canceledCount} scheduled class(es).`);
+        await ctx.reply(`Cancel today’s class for **${room.group_name || groupId}** at **${timeInput}**?`, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('Yes, cancel', `cancelclass_pick_${groupId}_${timeInput}`)],
+                [Markup.button.callback('No', 'cancelclass_no')]
+            ])
+        });
+        return;
     } catch (error) {
         await reportError('cancelclass command failed', error);
         ctx.reply('âŒ Failed to cancel the class. Please try again.');
+    }
+});
+
+bot.action('cancelclass_no', async (ctx) => {
+    try { await ctx.reply('Okay. No changes made.'); } catch {}
+    try { await ctx.answerCbQuery(); } catch {}
+});
+
+bot.action(/^cancelclass_group_(.+)$/, async (ctx) => {
+    try {
+        if (!(await requireSpecialist(ctx))) return ctx.answerCbQuery();
+        const groupId = String(ctx.match[1]);
+        await sendCancelClassPicker(ctx, groupId);
+    } catch (error) {
+        await reportError('cancelclass_group failed', error);
+        await ctx.reply('Unable to load classes right now.');
+    } finally {
+        try { await ctx.answerCbQuery(); } catch {}
     }
 });
 
@@ -3603,6 +3795,7 @@ bot.command('rescheduleclass', async (ctx) => {
             time: newTime,
             topic: oldClassDoc.data().topic || null,
             reminder_30_sent: false,
+            reminder_10_sent: false,
             reminder_15_sent: false,
             reminder_5_sent: false,
             reminder_0_sent: false,
@@ -3681,6 +3874,7 @@ bot.action(/^rescheduleclass_pick_(.+)_([0-9]{2}:[0-9]{2})_([0-9]{2}:[0-9]{2})$/
             time: newTime,
             topic: oldClassDoc.data().topic || null,
             reminder_30_sent: false,
+            reminder_10_sent: false,
             reminder_15_sent: false,
             reminder_5_sent: false,
             reminder_0_sent: false,
@@ -3733,6 +3927,7 @@ cron.schedule('* * * * *', async () => {
 
             let reminderType = null;
             if (minutesUntil === 30 && !classData.reminder_30_sent) reminderType = '30';
+        if (minutesUntil === 10 && !classData.reminder_10_sent) reminderType = '10';
             if (minutesUntil === 15 && !classData.reminder_15_sent) reminderType = '15';
             if (minutesUntil === 5 && !classData.reminder_5_sent) reminderType = '5';
             if (minutesUntil === 0 && !classData.reminder_0_sent) reminderType = '0';
