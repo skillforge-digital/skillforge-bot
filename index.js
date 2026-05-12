@@ -546,18 +546,13 @@ const BAD_WORD_PATTERNS = [
 ];
 
 const ADVERT_PATTERNS = [
-    /\bearn\b/i,
-    /\bmake money\b/i,
-    /\binvest\b/i,
-    /\bforex\b/i,
-    /\bcrypto\b/i,
-    /\bbet\b/i,
-    /\bloan\b/i,
+    /\bearn\s+(extra\s+)?money\b/i,
+    /\bmake\s+money\s+online\b/i,
+    /\bjoin\s+my\s+(group|channel|class)\b/i,
+    /\bloan\s+offer\b/i,
     /\bgiveaway\b/i,
-    /\bpromo\b/i,
-    /\bjoin my\b/i,
-    /\bwhatsapp\b/i,
-    /\btelegram\b/i
+    /\bpromo\s+code\b/i,
+    /\bwhatsapp\s+group\b/i
 ];
 
 const extractUrls = (text) => {
@@ -3700,6 +3695,9 @@ bot.on('my_chat_member', async (ctx) => {
 
 const handleVerification = async (ctx, groupIdHint = null) => {
     if (ctx.chat.type !== 'private') {
+        try {
+            await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message?.message_id);
+        } catch {}
         const groupId = ctx.chat?.id ? String(ctx.chat.id) : null;
         const link = groupId ? getVerifyLink(groupId) : getBotDirectMessageLink();
         try {

@@ -37,7 +37,7 @@ A comprehensive Telegram bot for managing Skillforge Digital Academy's classroom
    ```
 
 3. **Configure environment variables**:
-   Create a `.env` file with:
+   Create a `.env` file (or start from `.env.example`) with:
    ```
    BOT_TOKEN=your_telegram_bot_token
    BOT_USERNAME=your_bot_username
@@ -46,6 +46,7 @@ A comprehensive Telegram bot for managing Skillforge Digital Academy's classroom
    REPORT_LOGOTAG=Skillforge Digital Academy Principal Bot
    SERVER_URL=http://localhost:3000
    FIREBASE_JSON=your_firebase_service_account_json
+   OPENAI_API_KEY=optional_openai_key_for_ai_features
    REPORT_CHAT_ID=optional_chat_id_for_error_reports
    ```
 
@@ -59,6 +60,10 @@ A comprehensive Telegram bot for managing Skillforge Digital Academy's classroom
 The bot uses compound queries on `group_verifications` that may require a composite index:
 
 - `group_verifications`: `group_id` ASC, `verified` ASC, `removed` ASC
+- `group_verifications`: `user_id` ASC, `verified` ASC, `removed` ASC
+- `classes`: `date` ASC, `status` ASC
+- `classes`: `specialist_id` ASC, `date` ASC, `status` ASC
+- `questionnaire_sessions`: `user_id` ASC, `status` ASC, `created_at` DESC
 
 5. **Run the bot**:
    ```bash
