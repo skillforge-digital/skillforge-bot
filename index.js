@@ -2806,6 +2806,111 @@ bot.on('text', async (ctx, next) => {
         }
     } catch {}
 
+    try {
+        const scheduleSessionDoc = await db.collection('schedule_sessions').doc(userId).get();
+        if (scheduleSessionDoc.exists) {
+            const scheduleSession = scheduleSessionDoc.data() || {};
+            const status = String(scheduleSession.status || '');
+            if (status === 'awaiting_time' || status === 'awaiting_topic') {
+                const expiresAt = scheduleSession.expires_at?.toDate ? scheduleSession.expires_at.toDate() : null;
+                if (expiresAt && expiresAt.getTime() <= Date.now()) {
+                    await db.collection('schedule_sessions').doc(userId).update({
+                        status: 'expired',
+                        expired_at: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    await ctx.reply('Your scheduling session has expired. Please tap Yes again to start scheduling.');
+                    return;
+                }
+
+                const normalized = String(messageText || '').trim();
+                const lowered = normalized.toLowerCase();
+                if (lowered === 'cancel') {
+                    await db.collection('schedule_sessions').doc(userId).set({
+                        ...scheduleSession,
+                        status: 'canceled',
+                        canceled_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    await ctx.reply('✅ Scheduling canceled.');
+                    return;
+                }
+
+                if (status === 'awaiting_time') {
+                    const [timeInput, ...topicParts] = normalized.split(/\s+/);
+                    if (!CLASS_TIME_REGEX.test(timeInput)) {
+                        await ctx.reply('❌ Time must be HH:MM (24-hour). Example: 19:30');
+                        return;
+                    }
+
+                    const topicInline = topicParts.join(' ') || null;
+                    if (topicInline) {
+                        await ctx.reply('✅ Received. Scheduling now...');
+                        await scheduleLiveClass({
+                            groupId: scheduleSession.group_id,
+                            specialistId: userId,
+                            timeInput,
+                            topic: topicInline,
+                            dateStr: scheduleSession.date || null,
+                            telegram: ctx.telegram,
+                            reply: (text, extra) => ctx.reply(text, extra)
+                        });
+
+                        await db.collection('schedule_sessions').doc(userId).set({
+                            ...scheduleSession,
+                            status: 'completed',
+                            scheduled_time: timeInput,
+                            topic: topicInline,
+                            completed_at: admin.firestore.FieldValue.serverTimestamp()
+                        }, { merge: true });
+                        return;
+                    }
+
+                    await db.collection('schedule_sessions').doc(userId).set({
+                        ...scheduleSession,
+                        status: 'awaiting_topic',
+                        scheduled_time: timeInput,
+                        updated_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+
+                    await ctx.reply('✅ Time received. Now send the topic (or reply with "skip").');
+                    return;
+                }
+
+                if (status === 'awaiting_topic') {
+                    const timeInput = String(scheduleSession.scheduled_time || '').trim();
+                    if (!CLASS_TIME_REGEX.test(timeInput)) {
+                        await ctx.reply('❌ I lost the time for this scheduling session. Please tap Yes again to restart scheduling.');
+                        return;
+                    }
+
+                    const topic = (lowered === 'skip' || lowered === 'none' || lowered === 'no' || lowered === '-') ? null : normalized;
+                    await ctx.reply('✅ Topic received. Scheduling now...');
+
+                    await scheduleLiveClass({
+                        groupId: scheduleSession.group_id,
+                        specialistId: userId,
+                        timeInput,
+                        topic,
+                        dateStr: scheduleSession.date || null,
+                        telegram: ctx.telegram,
+                        reply: (text, extra) => ctx.reply(text, extra)
+                    });
+
+                    await db.collection('schedule_sessions').doc(userId).set({
+                        ...scheduleSession,
+                        status: 'completed',
+                        topic,
+                        completed_at: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    return;
+                }
+            }
+        }
+    } catch (error) {
+        await reportError('Schedule session handler failed', error);
+        await ctx.reply('❌ I could not process your scheduling message right now. Please try again.');
+        return;
+    }
+
     let activeSessionId = null;
     try {
         const activeDoc = await db.collection('questionnaire_active').doc(userId).get();
@@ -2912,111 +3017,6 @@ bot.on('text', async (ctx, next) => {
             await ctx.reply('✅ Response received. I ran into an error finishing your weekly review. Please try /weeklyreport later.');
             return;
         }
-    }
-
-    try {
-        const scheduleSessionDoc = await db.collection('schedule_sessions').doc(userId).get();
-        if (scheduleSessionDoc.exists) {
-            const scheduleSession = scheduleSessionDoc.data() || {};
-            const status = String(scheduleSession.status || '');
-            if (status === 'awaiting_time' || status === 'awaiting_topic') {
-                const expiresAt = scheduleSession.expires_at?.toDate ? scheduleSession.expires_at.toDate() : null;
-                if (expiresAt && expiresAt.getTime() <= Date.now()) {
-                    await db.collection('schedule_sessions').doc(userId).update({
-                        status: 'expired',
-                        expired_at: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                    await ctx.reply('Your scheduling session has expired. Please tap Yes again to start scheduling.');
-                    return;
-                }
-
-                const normalized = String(messageText || '').trim();
-                const lowered = normalized.toLowerCase();
-                if (lowered === 'cancel') {
-                    await db.collection('schedule_sessions').doc(userId).set({
-                        ...scheduleSession,
-                        status: 'canceled',
-                        canceled_at: admin.firestore.FieldValue.serverTimestamp()
-                    }, { merge: true });
-                    await ctx.reply('✅ Scheduling canceled.');
-                    return;
-                }
-
-                if (status === 'awaiting_time') {
-                    const [timeInput, ...topicParts] = normalized.split(/\s+/);
-                    if (!CLASS_TIME_REGEX.test(timeInput)) {
-                        await ctx.reply('❌ Time must be HH:MM (24-hour). Example: 19:30');
-                        return;
-                    }
-
-                    const topicInline = topicParts.join(' ') || null;
-                    if (topicInline) {
-                        await ctx.reply('✅ Received. Scheduling now...');
-                        await scheduleLiveClass({
-                            groupId: scheduleSession.group_id,
-                            specialistId: userId,
-                            timeInput,
-                            topic: topicInline,
-                            dateStr: scheduleSession.date || null,
-                            telegram: ctx.telegram,
-                            reply: (text, extra) => ctx.reply(text, extra)
-                        });
-
-                        await db.collection('schedule_sessions').doc(userId).set({
-                            ...scheduleSession,
-                            status: 'completed',
-                            scheduled_time: timeInput,
-                            topic: topicInline,
-                            completed_at: admin.firestore.FieldValue.serverTimestamp()
-                        }, { merge: true });
-                        return;
-                    }
-
-                    await db.collection('schedule_sessions').doc(userId).set({
-                        ...scheduleSession,
-                        status: 'awaiting_topic',
-                        scheduled_time: timeInput,
-                        updated_at: admin.firestore.FieldValue.serverTimestamp()
-                    }, { merge: true });
-
-                    await ctx.reply('✅ Time received. Now send the topic (or reply with "skip").');
-                    return;
-                }
-
-                if (status === 'awaiting_topic') {
-                    const timeInput = String(scheduleSession.scheduled_time || '').trim();
-                    if (!CLASS_TIME_REGEX.test(timeInput)) {
-                        await ctx.reply('❌ I lost the time for this scheduling session. Please tap Yes again to restart scheduling.');
-                        return;
-                    }
-
-                    const topic = (lowered === 'skip' || lowered === 'none' || lowered === 'no' || lowered === '-') ? null : normalized;
-                    await ctx.reply('✅ Topic received. Scheduling now...');
-
-                    await scheduleLiveClass({
-                        groupId: scheduleSession.group_id,
-                        specialistId: userId,
-                        timeInput,
-                        topic,
-                        dateStr: scheduleSession.date || null,
-                        telegram: ctx.telegram,
-                        reply: (text, extra) => ctx.reply(text, extra)
-                    });
-
-                    await db.collection('schedule_sessions').doc(userId).set({
-                        ...scheduleSession,
-                        status: 'completed',
-                        topic,
-                        completed_at: admin.firestore.FieldValue.serverTimestamp()
-                    }, { merge: true });
-                    return;
-                }
-            }
-        }
-    } catch (error) {
-        await reportError('Schedule session handler failed', error);
-        await ctx.reply('❌ I could not process your scheduling message right now. Please try again.');
-        return;
     }
 
     // Check if this is a feedback response (simple heuristic: contains rating or is reply)
